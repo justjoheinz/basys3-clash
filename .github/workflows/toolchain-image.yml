@@ -1,0 +1,94 @@
+# Build the openXC7 toolchain image (yosys + nextpnr-xilinx + prjxray, via Nix)
+# and push it to this repository's container registry, so bitstream.yml can pull it
+# in seconds instead of building it in tens of minutes.
+#
+# This is the expensive one. It runs only when the Containerfile changes, or by
+# hand. Nothing else should depend on it being fast.
+#
+# Architecture: this builds the image here, on the runner, so it is an amd64 image
+# and the arm64 one on a developer's Mac is irrelevant to CI. The Containerfile
+# pins no architecture -- the nixos/nix base is a multi-arch manifest and the Nix
+# expressions ask for builtins.currentSystem -- so the same file gives an
+# x86_64-linux toolchain here and an aarch64-linux one there. The tag carries the
+# architecture so the two can coexist in the registry.
+#
+# amd64 is also the faster of the two to build: the flake's binary cache covers
+# x86_64-linux far better than aarch64-linux, so nextpnr-xilinx is more likely to be
+# fetched than compiled. To build the arm64 image here instead -- for parity with an
+# Apple Silicon machine -- change runs-on to ubuntu-24.04-arm; everything else,
+# including the tag below, follows from uname.
+#
+# No --platform anywhere: each build is native on its own runner, which is the only
+# way this stays honest about no emulation being involved.
+name: openXC7 toolchain image
+
+# Manual only, like the bitstream workflow it feeds. Nothing in CI needs this image
+# -- the library's suite, the designs' suite, the HDL test bench and the lint all run
+# without it -- so building it on a Containerfile edit would be paying tens of
+# minutes for something no automatic check consumes.
+#
+# Run it once before the first Bitstream run, and again when the Containerfile
+# changes.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    name: Build and publish
+    runs-on: ubuntu-24.04
+    # nextpnr-xilinx compiles from source if the flake's binary cache does not have
+    # a build for this runner, and the Containerfile deliberately serialises that
+    # (max-jobs=1) because each translation unit wants ~2 GB.
+    timeout-minutes: 360
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # The Nix store, prjxray's database and the generated chipdb together are
+      # several GB. The runner image ships a lot that this job will never use.
+      - name: Free some disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          df -h /
+
+      # The Makefile drives podman (CONTAINER ?= podman), and `podman image exists`
+      # has no docker equivalent, so keep podman rather than swapping in docker.
+      - name: Ensure podman
+        run: |
+          if ! command -v podman >/dev/null; then
+            sudo apt-get update && sudo apt-get install -y podman
+          fi
+
+      - name: Log in to ghcr.io
+        run: echo '${{ secrets.GITHUB_TOKEN }}' \
+               | podman login ghcr.io -u '${{ github.actor }}' --password-stdin
+
+      # GHCR rejects upper case in a repository path, and an owner name may have it.
+      #
+      # The architecture is in the tag rather than in a manifest list: two tags is
+      # the whole of what is wanted here, and `podman manifest` would mean this job
+      # knowing about an image it did not build. bitstream.yml computes the same
+      # name the same way -- duplicated on purpose, since a composite action for six
+      # lines of shell is worse than the six lines.
+      - name: Work out the image name
+        id: image
+        run: |
+          case "$(uname -m)" in
+            x86_64)  arch=amd64 ;;
+            aarch64) arch=arm64 ;;
+            *)       arch=$(uname -m) ;;
+          esac
+          owner=$(echo '${{ github.repository_owner }}' | tr 'A-Z' 'a-z')
+          echo "ref=ghcr.io/$owner/openxc7-basys3:latest-$arch" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: make openxc7-image OPENXC7_IMAGE='${{ steps.image.outputs.ref }}'
+
+      - name: Push
+        run: podman push '${{ steps.image.outputs.ref }}'

@@ -179,6 +179,43 @@ ordinary Haskell.
 - `test/surfer-commands.txt` preselects signals by name (`tick`, `count`, `lit`), so
   inlining a named `where` binding in a design silently empties the waveform window.
 
+## CI
+
+`.github/workflows/` has three, and only the first runs by itself:
+
+| Workflow | When | What |
+| --- | --- | --- |
+| `ci.yml` | every push, PRs to `main` | the library's suite first, then the designs', then `make sim` and `make lint` |
+| `bitstream.yml` | **manual only** | place and route every design, `sd` on all three headers |
+| `toolchain-image.yml` | **manual only** | builds the openXC7 image, pushes it to ghcr.io |
+
+`ci.yml` is about the library: `stack build basys3` and `stack test basys3` are their
+own steps, ahead of anything with a `topEntity`, so a library failure is not buried
+under a design's. It needs no container — Stack plus apt's `iverilog` and `verilator`
+is the whole toolchain, and the container appears in only three lines of the Makefile
+(the `openxc7-image` and `$(BITSTREAM)` rules).
+
+The other two are manual because pin constraints and timing closure are properties of
+a design, not of the library. Run `bitstream.yml` by hand after touching a critical
+path: `Ascii.decDigits` is library code, nextpnr gets no `--timing-allow-fail`, and a
+depth regression is invisible to every other check here — `make test` and `make lint`
+are both perfectly happy with logic too deep to clock. It pulls the image
+`toolchain-image.yml` publishes, so **that has to have run at least once** first.
+
+CI is amd64 and a Mac is arm64; the Containerfile pins no architecture, so each side
+builds its own natively and the registry tag carries the arch (`:latest-amd64`,
+`:latest-arm64`). Both workflows derive that suffix from `uname -m`, so switching a
+job to `ubuntu-24.04-arm` needs no other edit.
+
+Both Stack caches are shared between `ci.yml` and `bitstream.yml` by key. Bump the
+`stack-work-v1-` prefix to discard the build-output cache — needed if a package is
+ever renamed, or the restored cache reproduces the `Ambiguous module name` failure
+above.
+
+Verilator comes from apt and is behind the 5.052 that `test/verilator.vlt` was
+written against. Both tool versions are echoed in the log, because a lint that fails
+only in CI is version drift before it is a defect.
+
 The README is long and is the real reference — design notes, the double-dabble
 timing table, the serial protocol, SD bring-up, and measured place-and-route figures
 per design.

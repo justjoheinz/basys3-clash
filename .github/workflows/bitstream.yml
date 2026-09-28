@@ -1,0 +1,130 @@
+# Place and route every design, and keep the bitstreams.
+#
+# Worth running even with no board attached: nextpnr is given no
+# --timing-allow-fail, so a design that no longer makes 100 MHz fails this job.
+# That is the regression this catches and nothing else does -- `make test` and
+# `make lint` are both perfectly happy with logic that is too deep to clock, which
+# is exactly how the double-dabble adder form got as far as it did (see
+# src/Ascii.hs).
+#
+# Needs the image toolchain-image.yml publishes. Not on every push: each design is
+# a few minutes of place and route.
+name: Bitstream
+
+# Manual only. Pin constraints and timing closure are properties of a design, not of
+# the library, and ci.yml is deliberately about the library -- so this is not
+# something every push should pay for. Run it by hand (Actions -> Bitstream -> Run
+# workflow) when a design's ports or constraints change, or after touching
+# Ascii.decDigits or anything else on a critical path, since a timing regression is
+# invisible to every other check in this repository.
+#
+# Add `push: branches: [main]` here if that changes.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: bitstream-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bitstream:
+    name: ${{ matrix.design }}${{ matrix.pmod && format(' ({0})', matrix.pmod) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    strategy:
+      # One design failing timing should not hide the state of the others.
+      fail-fast: false
+      matrix:
+        include:
+          - design: blinky
+          - design: io
+          - design: sketch
+          # Only the pin constraints differ per header, but a wrong .xdc is exactly
+          # the kind of thing that builds fine and then does nothing on the board.
+          - design: sd
+            pmod: JA
+          - design: sd
+            pmod: JB
+          - design: sd
+            pmod: JC
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Stack
+        uses: haskell-actions/setup@v2
+        with:
+          enable-stack: true
+          stack-version: latest
+          stack-no-global: true
+
+      # The same keys ci.yml writes, so this job usually starts warm off that run's
+      # cache rather than building the Clash compiler again per matrix leg.
+      - name: Cache ~/.stack
+        uses: actions/cache@v4
+        with:
+          path: ~/.stack
+          key: stack-${{ runner.os }}-${{ hashFiles('stack.yaml.lock', 'package.yaml', 'examples/package.yaml', 'clash-common.yaml') }}
+          restore-keys: |
+            stack-${{ runner.os }}-
+
+      - name: Cache build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            .stack-work
+            examples/.stack-work
+          key: stack-work-v1-${{ runner.os }}-${{ hashFiles('src/**/*.hs', 'spec/*.hs', 'examples/src/*.hs', 'examples/test/*.hs', 'examples/bin/*.hs', '*.yaml', 'examples/*.yaml') }}
+          restore-keys: |
+            stack-work-v1-${{ runner.os }}-
+
+      - name: Ensure podman
+        run: |
+          if ! command -v podman >/dev/null; then
+            sudo apt-get update && sudo apt-get install -y podman
+          fi
+
+      # The tag carries the architecture, worked out the same way toolchain-image.yml
+      # works it out, so this pulls an image built for the runner it is about to run
+      # on. Change runs-on and the right image follows without editing this.
+      - name: Pull the toolchain image
+        id: image
+        run: |
+          case "$(uname -m)" in
+            x86_64)  arch=amd64 ;;
+            aarch64) arch=arm64 ;;
+            *)       arch=$(uname -m) ;;
+          esac
+          owner=$(echo '${{ github.repository_owner }}' | tr 'A-Z' 'a-z')
+          ref="ghcr.io/$owner/openxc7-basys3:latest-$arch"
+          echo '${{ secrets.GITHUB_TOKEN }}' | podman login ghcr.io -u '${{ github.actor }}' --password-stdin
+          podman pull "$ref"
+          podman image inspect "$ref" --format 'pulled {{.Os}}/{{.Architecture}}'
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      # OPENXC7_IMAGE rather than tagging it locally: `make bitstream` checks the
+      # image exists under exactly the name it is about to run.
+      - name: Place and route
+        run: |
+          make bitstream \
+            DESIGN='${{ matrix.design }}' \
+            ${{ matrix.pmod && format('PMOD={0}', matrix.pmod) || '' }} \
+            OPENXC7_IMAGE='${{ steps.image.outputs.ref }}'
+
+      # The .bit is the deliverable; the report is what says at what frequency, and
+      # the FASM is what says the pin constraints were actually applied.
+      - name: Keep the bitstream and reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bitstream-${{ matrix.design }}${{ matrix.pmod && format('-{0}', matrix.pmod) }}
+          path: |
+            build/openxc7/**/*.bit
+            build/openxc7/**/*.report.json
+            build/openxc7/**/*.fasm
+          if-no-files-found: error
