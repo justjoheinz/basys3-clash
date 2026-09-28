@@ -1,0 +1,70 @@
+# The demo half, and everything that has to know a design exists.
+#
+# Three components, and the reason they are together is the dependency graph rather
+# than taste: all three need the designs, and the designs need the library, so any
+# of them living in the library's package would make the two packages depend on each
+# other.
+#
+#   src/   one module per design, and the only place a `topEntity` lives. DESIGN= in
+#          the Makefile picks which one Clash is pointed at.
+#   bin/   the Clash compiler driver. `stack run clash -- IoDemo --verilog` is only
+#          meaningful where IoDemo is in scope, which is here and not in blinky.
+#   test/  the Haskell test suite. It checks the library and the designs together --
+#          exact bytes on the UART, the SD state machine against a fake card -- so it
+#          needs both packages in scope. The HDL-side fixtures stay in the project's
+#          own test/ directory, because Verilator and Icarus read those, not GHC.
+#
+# What this buys over one package with two source-dirs: `import IoDemo` inside src/
+# is now a compile error instead of something a reviewer has to notice.
+name:      blinky-examples
+version:   0.1.0.0
+synopsis:  Designs for the Basys3, built from the blinky library
+
+dependencies:
+  - base                    >=4.18 && <5
+  - clash-prelude           >=1.10 && <1.12
+  - ghc-typelits-extra        >=0.5
+  - ghc-typelits-knownnat     >=0.8
+  - ghc-typelits-natnormalise >=0.9
+  - template-haskell
+  # The library this package exists to demonstrate.
+  - blinky
+
+library:
+  <<: !include "../clash-common.yaml"
+  source-dirs: src
+
+tests:
+  unit:
+    <<: !include "../clash-common.yaml"
+    main: Spec.hs
+    source-dirs: test
+    dependencies:
+      - blinky-examples
+
+# `stack run clash -- IoDemo --verilog` generates HDL; `clashi` is the same thing
+# interactive. Neither includes clash-common.yaml: these two files are ordinary
+# Haskell, and the hardware stanza has no business reaching them.
+#
+# They depend on this package's library because the Clash compiler resolves the
+# module it is given -- IoDemo, SdDemo -- through its own GHC package environment.
+# That is also why the plugin packages are top-level above: Clash enables those
+# plugins by default, so they have to be visible here too.
+#
+# other-modules is pinned empty because both entry points share bin/ and both are
+# `module Main` -- left to glob, each would try to compile the other as a submodule.
+executables:
+  clash: &driver
+    main: Clash.hs
+    source-dirs: bin
+    other-modules: []
+    # Loading GHC plugins at runtime requires a dynamically linked GHC session.
+    when:
+      - condition: "!os(windows)"
+        ghc-options: -dynamic
+    dependencies:
+      - blinky-examples
+      - clash-ghc
+  clashi:
+    <<: *driver
+    main: Clashi.hs

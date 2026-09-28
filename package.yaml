@@ -1,0 +1,25 @@
+# The reusable half: wire protocols, peripherals, one Pmod, this board's facts, and
+# the two modules that sit outside those namespaces on purpose (Ascii, Serial).
+# Nothing in here knows which design is being built, and now nothing in here *can*
+# import one -- the designs live in a package that depends on this one, so the
+# boundary is a dependency edge rather than a promise. See examples/package.yaml.
+#
+# This file is the source of truth and blinky.cabal is generated from it by hpack,
+# which Stack runs on every build. No module lists appear below: hpack finds them by
+# walking source-dirs, so adding a peripheral is a new file and nothing else.
+name:      blinky
+version:   0.1.0.0
+synopsis:  Clash building blocks for the Digilent Basys3 (Artix-7 xc7a35t)
+
+dependencies:
+  - base                    >=4.18 && <5
+  - clash-prelude           >=1.10 && <1.12
+  - ghc-typelits-extra        >=0.5
+  - ghc-typelits-knownnat     >=0.8
+  - ghc-typelits-natnormalise >=0.9
+  # For Ascii.ascii, which turns a string literal into a Vec at compile time.
+  - template-haskell
+
+library:
+  <<: !include "clash-common.yaml"
+  source-dirs: src

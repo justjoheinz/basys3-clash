@@ -1,0 +1,51 @@
+# Settings shared by every component that contains Clash (hardware) code, merged
+# into each with `<<: !include`. Both packages include this file, which is the
+# point: a plugin or an extension enabled for the library but not for a design is
+# a difference that shows up as a type error in one place and not the other.
+#
+# The include has to be a plain merge key. `&anchor !include ...` looks tidier but
+# hpack does not see the anchor and fails with "Unknown alias".
+#
+# Not included by the clash/clashi executables: those two are ordinary Haskell.
+language: Haskell2010
+default-extensions:
+  - BangPatterns
+  - BinaryLiterals
+  - ConstraintKinds
+  - DataKinds
+  - DefaultSignatures
+  - DeriveAnyClass
+  - DeriveDataTypeable
+  - DeriveFoldable
+  - DeriveFunctor
+  - DeriveGeneric
+  - DeriveLift
+  - DeriveTraversable
+  - DerivingStrategies
+  - InstanceSigs
+  - KindSignatures
+  - LambdaCase
+  - NoImplicitPrelude
+  - NoStarIsType
+  - NumericUnderscores
+  - PolyKinds
+  - QuasiQuotes
+  - RankNTypes
+  - ScopedTypeVariables
+  - StandaloneDeriving
+  - TemplateHaskell
+  - TupleSections
+  - TypeApplications
+  - TypeFamilies
+  - TypeOperators
+  - ViewPatterns
+ghc-options:
+  - -Wall
+  - -Wcompat
+  # The three type-level plugins are what make Clash's size-indexed types bearable.
+  - -fplugin=GHC.TypeLits.Extra.Solver
+  - -fplugin=GHC.TypeLits.Normalise
+  - -fplugin=GHC.TypeLits.KnownNat.Solver
+  # Clash needs unfoldings of everything it compiles to hardware.
+  - -fexpose-all-unfoldings
+  - -fno-worker-wrapper

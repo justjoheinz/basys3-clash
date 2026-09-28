@@ -1,0 +1,15 @@
+// Lint waivers for the Verilog Clash generates. Used by `make lint`.
+//
+// Clash zero-extends every vector index to 64 bits before indexing:
+//
+//   assign c$d_app_arg = $unsigned({{(64-2) {1'b0}},sel});
+//   assign d = vecArray_0[c$d_app_arg];
+//
+// The index is provably in range -- its Haskell type is `Index 4` -- so the
+// truncation reported here is a code-generation style, not a defect. The waiver
+// is scoped to the generated directory, and `lint_off -match` is not supported
+// in Verilator 5.052, so it cannot be narrowed to the one message text.
+`verilator_config
+lint_off -rule WIDTHTRUNC -file "*/Blinky.topEntity/*.v"
+lint_off -rule WIDTHTRUNC -file "*/SdDemo.topEntity/*.v"
+lint_off -rule WIDTHTRUNC -file "*/IoDemo.topEntity/*.v"

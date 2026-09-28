@@ -1,0 +1,41 @@
+# Stack's view of this project. Two packages, each described by its own
+# package.yaml, and between them they keep every build-depends, extension and
+# ghc-option including the three type-level plugins. Nothing about the build moves in
+# here; what lives here is the one thing a package description deliberately cannot
+# say, which is *which versions*.
+#
+# Clash 1.10.2 is nightly-only. The current LTS carries clash-ghc 1.8.5, two minor
+# versions below what this code is written against, so an `lts-*` snapshot would
+# mean pinning clash-prelude, clash-lib, clash-ghc and whatever of their
+# dependencies the LTS holds at the wrong version -- by hand, and again on every
+# bump. A *dated* nightly is immutable once published, so this pin is exactly as
+# reproducible as an LTS; the only difference is that moving it is a deliberate act
+# rather than a minor-version drift.
+#
+# nightly-2026-09-24 has all three Clash packages at 1.10.2 and puts them on
+# GHC 9.12.4, which is why there are no extra-deps at all below. If you move this
+# pin, check clash-prelude's `tested-with` against the snapshot's compiler.
+snapshot: nightly-2026-09-24
+
+# blinky is the library, blinky-examples the designs built on it plus the Clash
+# driver and the test suite. The edge only runs one way, and Stack is what enforces
+# it: an import of a design from src/ cannot resolve.
+packages:
+  - .
+  - examples
+
+# Let Stack fetch and own its compiler. This is the point of a Stack-only setup:
+# the snapshot names the GHC it wants, Stack installs that exact version under
+# ~/.stack/programs, and no second tool has to be kept in step with it by hand.
+# A ghcup GHC can still serve other projects -- it just has no say in this one.
+install-ghc: true
+system-ghc: false
+
+# There is no `write-ghc-environment-files` equivalent here, and none is needed.
+# Cabal has to write a .ghc.environment file because the `clash` executable embeds
+# the GHC API and resolves packages through GHC's own databases rather than through
+# the build tool -- that file is how clash-prelude, this project's own library and
+# the -fplugin packages become visible to it. Stack solves the same problem by
+# setting GHC_PACKAGE_PATH for anything it launches, so `stack run clash` and
+# `stack run clashi` get that environment without a file on disk. `make verilog` is
+# the target that exercises it.

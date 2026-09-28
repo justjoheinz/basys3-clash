@@ -1,0 +1,16 @@
+# Signals to show when `make waves` opens Surfer, so the window starts on
+# something useful instead of empty. Passed via `surfer -c`.
+#
+# Paths are relative to the generated test bench's top scope. `tick` is the blink
+# prescaler's pulse and `count` its counter; `lit` is the blink phase, which the
+# LED bus is a plain mux of; `digits` is the four BCD digits packed into 16 bits,
+# and `sel` is the display scan position driven by `tick_0`.
+variable_add testBench.clk
+variable_add testBench.rst
+variable_add testBench.tick
+variable_add testBench.count
+variable_add testBench.lit
+variable_add testBench.digits
+variable_add testBench.tick_0
+variable_add testBench.sel
+zoom_fit

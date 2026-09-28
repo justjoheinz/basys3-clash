@@ -1,0 +1,26 @@
+# Build output. Everything here is recreated by `make` or `stack`.
+
+# Haskell. Both .cabal files are generated from a package.yaml by hpack on every
+# build; GHC reads a .ghc.environment from the cwd, and the ids in one are
+# host-specific.
+.stack-work/
+*.cabal
+.ghc.environment.*
+*.hi
+*.o
+*.hie
+*.dyn_hi
+*.dyn_o
+*.p_hi
+*.p_o
+
+# Clash, one directory per backend and named by it.
+verilog/
+vhdl/
+systemverilog/
+
+# make sim, make bitstream.
+sim/
+build/
+
+.DS_Store
