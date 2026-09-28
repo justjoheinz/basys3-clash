@@ -7,18 +7,20 @@
 #
 #   src/   one module per design, and the only place a `topEntity` lives. DESIGN= in
 #          the Makefile picks which one Clash is pointed at.
-#   bin/   the Clash compiler driver. `stack run clash -- IoDemo --verilog` is only
-#          meaningful where IoDemo is in scope, which is here and not in blinky.
-#   test/  the Haskell test suite. It checks the library and the designs together --
-#          exact bytes on the UART, the SD state machine against a fake card -- so it
-#          needs both packages in scope. The HDL-side fixtures stay in the project's
-#          own test/ directory, because Verilator and Icarus read those, not GHC.
+#   bin/   the Clash compiler driver. `stack run clash -- Io --verilog` is only
+#          meaningful where Io is in scope, which is here and not in basys3.
+#   test/  the designs' test suite: whether each design wires the library's parts up
+#          the way its documentation says -- the exact bytes it puts on the UART, the
+#          digit it shows after a press. What the library claims on its own is the
+#          library's to check, in basys3's own suite (../spec/). The HDL-side
+#          fixtures stay in the project's own test/ directory, because Verilator and
+#          Icarus read those, not GHC.
 #
-# What this buys over one package with two source-dirs: `import IoDemo` inside src/
+# What this buys over one package with two source-dirs: `import Io` inside src/
 # is now a compile error instead of something a reviewer has to notice.
-name:      blinky-examples
+name:      basys3-examples
 version:   0.1.0.0
-synopsis:  Designs for the Basys3, built from the blinky library
+synopsis:  Designs for the Basys3, built from the basys3 library
 
 dependencies:
   - base                    >=4.18 && <5
@@ -28,7 +30,7 @@ dependencies:
   - ghc-typelits-natnormalise >=0.9
   - template-haskell
   # The library this package exists to demonstrate.
-  - blinky
+  - basys3
 
 library:
   <<: !include "../clash-common.yaml"
@@ -40,14 +42,14 @@ tests:
     main: Spec.hs
     source-dirs: test
     dependencies:
-      - blinky-examples
+      - basys3-examples
 
-# `stack run clash -- IoDemo --verilog` generates HDL; `clashi` is the same thing
+# `stack run clash -- Io --verilog` generates HDL; `clashi` is the same thing
 # interactive. Neither includes clash-common.yaml: these two files are ordinary
 # Haskell, and the hardware stanza has no business reaching them.
 #
 # They depend on this package's library because the Clash compiler resolves the
-# module it is given -- IoDemo, SdDemo -- through its own GHC package environment.
+# module it is given -- Io, Sd -- through its own GHC package environment.
 # That is also why the plugin packages are top-level above: Clash enables those
 # plugins by default, so they have to be visible here too.
 #
@@ -63,7 +65,7 @@ executables:
       - condition: "!os(windows)"
         ghc-options: -dynamic
     dependencies:
-      - blinky-examples
+      - basys3-examples
       - clash-ghc
   clashi:
     <<: *driver

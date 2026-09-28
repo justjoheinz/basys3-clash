@@ -32,14 +32,25 @@ headers, one module per thing you can buy: this one is the Digilent Pmod SD. Wha
 belongs here is the module's own protocol, not its pinout -- which header it is on
 is a constraints question (@constraints\/PmodSD-J{A,B,C}.xdc@), and the card cares
 about neither. It builds on "Protocol.SPI" for the wire timing.
+
+The port /names/ are a different matter from the pinout, and they are here:
+'sdPinsPort' and 'sdInputPorts' spell the six nets this module needs brought out,
+and all three of those constraints files use those same six names. A design's
+@topEntity@ should not be retyping them -- see "Basys3" for the rest of that
+argument.
 -}
 module Pmod.SdCard
   ( Stage(..)
   , SdOut(..)
+  , SdPins(..)
   , crc7
   , frameFor
   , commandFor
   , sdCard
+  , sdPins
+    -- * Naming the pins
+  , sdInputPorts
+  , sdPinsPort
   ) where
 
 import Clash.Prelude
@@ -47,7 +58,7 @@ import Clash.Prelude
 import Protocol.SPI (SpiOut (..), spiMaster)
 
 -- | How far the card has been brought up. Doubles as a diagnostic: 'SdOut'
--- reports it, and 'SdDemo' shows it on the LEDs, which is why it is a plain
+-- reports it, and the 'Sd' design shows it on the LEDs, which is why it is a plain
 -- enumeration with a four-bit 'BitPack' encoding.
 data Stage
   = PowerOn    -- ^ clocking with the card deselected, as its power-on needs
@@ -60,7 +71,8 @@ data Stage
   | Ready      -- ^ the block has been read
   | Failed     -- ^ gave up; 'sdFault' says where. Passed through briefly on the
                --   way back to 'PowerOn' for another attempt, so a design that
-               --   wants to report it has to latch it.
+               --   wants to report it wants @'Latch.latch' ((== 'Failed') . 'sdStage'
+               --   \<$\> out)@ -- see 'Sd'.
   deriving (Generic, NFDataX, BitPack, Show, Eq)
 
 -- | Where the byte-level engine is within a stage.
@@ -118,6 +130,45 @@ data SdOut = SdOut
     -- ^ Block bytes, streamed with their index as they arrive.
   }
   deriving (Generic, NFDataX, Show, Eq)
+
+-- | Just the three pins, for a @topEntity@ that has to bring them out to the
+-- header.
+--
+-- Separate from 'SdOut' because only these three are wires: the rest of 'SdOut'
+-- is what the card has said, which a design reports however it likes. A record
+-- rather than a triple because all three are 'Bit' and so a triple of them is
+-- three ways round that all typecheck -- and SCK swapped with MOSI is a card that
+-- simply never answers.
+data SdPins = SdPins
+  { csPin   :: Bit
+    -- ^ Chip select, active low.
+  , sckPin  :: Bit
+  , mosiPin :: Bit
+  }
+  deriving (Generic, NFDataX, BitPack, ShowX, Show, Eq)
+
+-- | The pins out of 'sdCard''s output.
+sdPins :: SdOut -> SdPins
+sdPins o = SdPins { csPin = sdCs o, sckPin = sdSck o, mosiPin = sdMosi o }
+
+-- | What the module drives, in the order 'SdPins' names them. Flat inside a
+-- design's output product, as @sd_cs@, @sd_sck@ and @sd_mosi@.
+--
+-- @'PortProduct' ""@ rather than @Basys3.ports@, which is the same function: this
+-- module knows nothing about which board it is plugged into, and should not start
+-- now.
+sdPinsPort :: PortName
+sdPinsPort =
+  PortProduct "" [PortName "sd_cs", PortName "sd_sck", PortName "sd_mosi"]
+
+-- | What the module needs read, in the order 'sdCard' and a design around it take
+-- them: MISO, then the socket's two switches.
+--
+-- Card detect and write protect are not 'sdCard''s business -- it never looks at
+-- them -- but they are wired to the header whether a design uses them or not, so
+-- the names belong with the rest.
+sdInputPorts :: [PortName]
+sdInputPorts = [PortName "sd_miso", PortName "sd_cd", PortName "sd_wp"]
 
 -- | CRC7 over a command's first five bytes, polynomial @x^7 + x^3 + 1@. Cards
 -- ignore the CRC of most commands in SPI mode, but CMD0 and CMD8 are sent before

@@ -1,17 +1,22 @@
 {-|
 A pretend SD card: enough of one to drive "Pmod.SdCard" through its whole
-initialisation sequence and a block read inside @cabal test@, with no hardware
+initialisation sequence and a block read inside @stack test@, with no hardware
 and no HDL simulator.
 
-It is a real SPI slave, shifting bits on the same edges a card does, so the test
-covers the bit-level timing of "Protocol.SPI" as well as the protocol above it.
-What it is not is a model of a card's misbehaviour: it answers promptly, never
-reports an error, and claims to be a high-capacity card. Timeouts and error
-tokens are 'Pmod.SdCard''s problem and are not exercised here.
+It is a real SPI slave, shifting bits on the same edges a card does, so a test
+that uses it covers the bit-level timing of "Protocol.SPI" as well as the
+protocol above it. What it is not is a model of a card's misbehaviour: it answers
+promptly, never reports an error, and claims to be a high-capacity card. Timeouts
+and error tokens are 'Pmod.SdCard''s problem, and the way to exercise those is to
+hold MISO high and watch the retry.
 
-This module lives in the test suite rather than the library because nothing here
-is meant to be synthesised. It keeps the namespace of the module it stands in for,
-so the double sits next to the real thing.
+__Why this ships with the library__ rather than sitting in a test directory: it is
+what makes an SD design testable without a card in the socket, which is a thing
+somebody writing their own controller wants and not only a thing this library's
+own tests want. It is also ordinary synthesisable Clash -- two of them and a
+controller would fit on the board -- so there is nothing here that a library has
+to keep out. It keeps the namespace of the module it stands in for, so the double
+sits next to the real thing.
 -}
 module Pmod.FakeSdCard
   ( fakeCard

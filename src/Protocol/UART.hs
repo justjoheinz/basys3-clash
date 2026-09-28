@@ -28,7 +28,7 @@ transfer /is/ both directions at once.
 
 The @Protocol@ namespace is for wire timing and framing that everything on the
 link shares, never anything about what the bytes mean. Its other member is
-"Protocol.SPI"; this module's first user is "IoDemo".
+"Protocol.SPI"; this module's first user is "Io".
 -}
 module Protocol.UART
   ( UartTx(..)
@@ -55,8 +55,9 @@ data UartRx = UartRx
     -- high.
   , rxError :: Bool
     -- ^ True for a single cycle when a stop bit was sampled low. No byte is
-    -- reported for that frame. Latch it if it is to be displayed: almost always
-    -- it means the two ends disagree about the bit period.
+    -- reported for that frame. @'Latch.latch' (rxError \<$\> heard)@ if it is to be
+    -- displayed: almost always it means the two ends disagree about the bit
+    -- period, and ten nanoseconds of it is not something anybody sees.
   }
   deriving (Generic, NFDataX, Show, Eq)
 

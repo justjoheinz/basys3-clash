@@ -4,10 +4,14 @@
 # import one -- the designs live in a package that depends on this one, so the
 # boundary is a dependency edge rather than a promise. See examples/package.yaml.
 #
-# This file is the source of truth and blinky.cabal is generated from it by hpack,
+# This file is the source of truth and basys3.cabal is generated from it by hpack,
 # which Stack runs on every build. No module lists appear below: hpack finds them by
 # walking source-dirs, so adding a peripheral is a new file and nothing else.
-name:      blinky
+#
+# The name is the board, because that is what the package is about. It was `blinky`
+# for as long as the blinking was the point; the demo that gave it that name is now
+# one file in examples/src/ and not even the interesting one.
+name:      basys3
 version:   0.1.0.0
 synopsis:  Clash building blocks for the Digilent Basys3 (Artix-7 xc7a35t)
 
@@ -23,3 +27,19 @@ dependencies:
 library:
   <<: !include "clash-common.yaml"
   source-dirs: src
+
+# The library's own suite, so that `stack test basys3` says whether the library
+# works without a single design in scope -- which is the question somebody who has
+# just bumped the snapshot is asking. The designs have their own suite next door
+# (examples/test/), and it checks a different thing: that they wire these parts up
+# the way their documentation says.
+#
+# spec/ rather than test/, which is taken: test/ holds the HDL fixtures that
+# Verilator and Icarus read, and those are not GHC's business.
+tests:
+  spec:
+    <<: !include "clash-common.yaml"
+    main: Spec.hs
+    source-dirs: spec
+    dependencies:
+      - basys3

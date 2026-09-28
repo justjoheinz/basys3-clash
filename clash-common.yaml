@@ -22,6 +22,13 @@ default-extensions:
   - DeriveLift
   - DeriveTraversable
   - DerivingStrategies
+  # Not in Clash's own template, and needed by every design that names this
+  # board: `HiddenClockResetEnable Basys3` is a constraint on a concrete type
+  # rather than on a variable, which Haskell2010 does not allow. Without it here,
+  # the recommended shape of a design fails to compile until its author adds a
+  # pragma about an extension they had no reason to have heard of -- which is
+  # exactly the boilerplate src/Basys3.hs exists to remove.
+  - FlexibleContexts
   - InstanceSigs
   - KindSignatures
   - LambdaCase

@@ -1,14 +1,9 @@
 ## The Basys3's USB-UART bridge: the two FPGA pins wired to channel B of the
-## FT2232HQ. Pin assignments cross-checked against Digilent's Basys-3-Master.xdc:
-## https://github.com/Digilent/digilent-xdc
+## FT2232HQ.
 ##
-## Not part of the default constraint set, for the reason
-## constraints/Basys3-Inputs.xdc gives: a .xdc that names ports the netlist does
-## not have is at best noise and at worst an error. Add it to a design's XDC list
-## in the Makefile only once its top entity has these ports, as DESIGN=io does:
-##
-##   XDC ?= constraints/Basys3.xdc constraints/Basys3-Inputs.xdc \
-##          constraints/Basys3-Uart.xdc
+## Opt-in, for the reason constraints/Basys3.xdc gives: add it to a design's XDC
+## list in the Makefile once its top entity has these ports, as DESIGN=io does.
+## src/Basys3.hs names them uartRxPort and uartTxPort.
 ##
 ## The FT2232HQ is a two-channel part doing two different jobs on one cable and
 ## one connector (J4): channel A is the USB-JTAG openFPGALoader talks to, and

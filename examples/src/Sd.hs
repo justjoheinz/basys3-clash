@@ -20,17 +20,17 @@ card turns @F1FF@ into the card's data within a few milliseconds. btnC resets th
 whole domain, which starts again from scratch and is how to re-read after a card
 has been swapped.
 -}
-module SdDemo
+module Sd
   ( lights
-  , sdDemo
+  , sd
   , topEntity
   ) where
 
-import Clash.Prelude
-
-import Basys3                  (Basys3, Leds, Settle, prescaler)
-import Peripheral.SevenSegment (display, hexDigits)
-import Pmod.SdCard             (SdOut (..), Stage (..), sdCard)
+import Basys3.Board
+-- Not part of "Basys3.Board", on purpose: a Pmod is something you bought
+-- separately and plugged in, so the design that uses one says which.
+import Pmod.SdCard (SdOut (..), SdPins, Stage (..), sdCard, sdInputPorts, sdPins,
+                    sdPinsPort)
 
 -- | What the LEDs show, most significant bit first:
 --
@@ -57,8 +57,8 @@ lights o gaveUp cd wp =
    ++# pack (sdStage o)
 
 -- | The board design. Both periods are parameters for the same reason
--- 'Blinky.blinky''s are: so a simulation can pick small ones.
-sdDemo
+-- 'Blinky.blinky''s period is: so a simulation can pick small ones.
+sd
   :: HiddenClockResetEnable dom
   => Unsigned 16
   -- ^ SPI half period in cycles minus one; 124 is 400 kHz at 100 MHz.
@@ -67,9 +67,11 @@ sdDemo
   -> Signal dom Bit  -- ^ MISO
   -> Signal dom Bit  -- ^ card detect
   -> Signal dom Bit  -- ^ write protect
-  -> Signal dom (Bit, Bit, Bit, BitVector 16, BitVector 7, BitVector 4, Bit)
-sdDemo half dwell miso cd wp =
-  bundle (sdCs <$> out, sdSck <$> out, sdMosi <$> out, leds, seg, anode, pure high)
+  -> Signal dom (SdPins, Leds, Display)
+-- 'hold' rather than 'dwell' for the reason 'Io.io' gives: the board's name for
+-- this number is in scope, and this circuit takes its own.
+sd half hold miso cd wp =
+  bundle (sdPins <$> out, leds, Display <$> seg <*> anode <*> pure high)
  where
   out  = sdCard half miso
   leds = lights <$> out <*> gaveUp <*> cd <*> wp
@@ -85,20 +87,21 @@ sdDemo half dwell miso cd wp =
   -- readable. Once a read succeeds the diagnostic is no longer interesting.
   failing = (== Failed) . sdStage <$> out
   ready   = (== Ready) . sdStage <$> out
-  seen    = register False (failing .||. seen)
-  gaveUp  = seen .&&. (not <$> ready)
-  report  = regEn 0 failing (diagnose <$> out)
+  gaveUp  = latch failing .&&. (not <$> ready)
+  -- 'diagnostic', not 'report': "Serial"'s 'report' is in scope through
+  -- "Basys3.Board", and this design does not talk to the host at all.
+  diagnostic = regEn 0 failing (diagnose <$> out)
   diagnose o = 0xF000
                  .|. shiftL (zeroExtend (pack (sdFault o))) 8
                  .|. zeroExtend (sdR1 o)
 
-  (seg, anode) = display (prescaler dwell) (hexDigits <$> mux gaveUp report word)
+  (seg, anode) = display (prescaler hold) (hexDigits <$> mux gaveUp diagnostic word)
 
 -- | 400 kHz on the card -- the fastest a card may be clocked before it is
 -- initialised, and fast enough that the 512-byte block takes about 11 ms. Each
 -- display digit is held for 100e3 cycles (1 ms), giving a 250 Hz refresh.
 --
--- btnC arrives through 'resetGlitchFilter' at 'Settle', for the reason
+-- btnC arrives debounced through 'Basys3.onBoard', for the reason
 -- 'Basys3.settle' gives: this design has no buttons of its own, but btnC is its
 -- retry button, and an undebounced one starts an attempt per bounce rather than
 -- per press -- so the LEDs would flicker through several initialisations and only
@@ -109,27 +112,10 @@ topEntity
   -> Signal Basys3 Bit
   -> Signal Basys3 Bit
   -> Signal Basys3 Bit
-  -> Signal Basys3 (Bit, Bit, Bit, BitVector 16, BitVector 7, BitVector 4, Bit)
-topEntity clk rst miso cd wp =
-  withClockResetEnable clk (resetGlitchFilter (SNat @Settle) clk rst) enableGen
-    (sdDemo 124 99_999 miso cd wp)
+  -> Signal Basys3 (SdPins, Leds, Display)
+topEntity clk rst miso cd wp = onBoard clk rst (sd 124 99_999 miso cd wp)
 {-# NOINLINE topEntity #-}
 {-# ANN topEntity
-  (Synthesize
-    { t_name   = "sddemo"
-    , t_inputs = [ PortName "clk"
-                 , PortName "rst"
-                 , PortName "sd_miso"
-                 , PortName "sd_cd"
-                 , PortName "sd_wp"
-                 ]
-    , t_output = PortProduct ""
-                   [ PortName "sd_cs"
-                   , PortName "sd_sck"
-                   , PortName "sd_mosi"
-                   , PortName "led"
-                   , PortName "seg"
-                   , PortName "an"
-                   , PortName "dp"
-                   ]
-    }) #-}
+  (basys3 "sd"
+    sdInputPorts
+    (ports [sdPinsPort, ledsPort, displayPort])) #-}

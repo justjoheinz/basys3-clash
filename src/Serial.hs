@@ -45,9 +45,12 @@ module Serial
   , atReset
     -- * What came back
   , UartRx (..)
+  , decoded
   ) where
 
 import Clash.Prelude
+
+import Control.Monad ((>=>))
 
 import Protocol.UART (UartRx (..), UartTx (..), uartRx, uartTx)
 
@@ -229,9 +232,6 @@ driving
   -> Signal dom UartTx
 driving period src = tx
  where
-  -- Annotated so the loop below stays in this signature's domain under
-  -- MonoLocalBinds rather than being inferred in one of its own.
-  tx :: Signal dom UartTx
   tx         = uartTx period offer
   (offer, _) = src (txIdle <$> tx)
 
@@ -253,6 +253,28 @@ serial
   -> (Signal dom Bit, Signal dom UartRx)
   -- ^ The transmit pin, and what the host has sent.
 serial period rxPin src = (txLine <$> driving period src, uartRx period rxPin)
+
+-- | What the host asked for, if anything: give it the meaning of one byte and
+-- what came back from 'serial'.
+--
+-- @
+-- typed = 'decoded' typedAs heard   -- 'Signal' dom ('Maybe' Typed)
+-- @
+--
+-- The two ways of getting 'Nothing' collapse on purpose -- no byte arrived this
+-- cycle, or one did and it meant nothing to this design -- because both want the
+-- same thing done about them, which is nothing. That is what makes a request an
+-- input to this cycle's update like any button press, with no state anywhere to
+-- say a command is half-said: see 'Io.typedAs' for a whole vocabulary written
+-- this way, and note that a command too long for one byte needs a state machine
+-- of its own rather than this.
+decoded
+  :: (BitVector 8 -> Maybe a)
+  -- ^ What one byte means. 'Nothing' for the bytes this design ignores, which is
+  -- most of what a terminal sends.
+  -> Signal dom UartRx
+  -> Signal dom (Maybe a)
+decoded meaning = fmap (rxByte >=> meaning)
 
 -- | For a design that only talks. Builds no receiver at all, which is the
 -- honest shape when there is no pin to give one.

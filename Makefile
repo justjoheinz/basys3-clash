@@ -4,11 +4,9 @@
 # bitstream comes out of yosys + nextpnr-xilinx + prjxray in a native arm64
 # container (syn/openxc7.Containerfile). No vendor toolchain, no emulation.
 #
-# Three designs live here; DESIGN picks one for every target below:
-#   make bitstream            the blinking LEDs and their counter (default)
-#   make bitstream DESIGN=sd  reading block zero of an SD card on a Pmod SD
-#   make bitstream DESIGN=io  the switches on the LEDs, the buttons on a counter,
-#                             and that counter to and from the host over UART
+# DESIGN picks one design for every target below; `make designs` lists them.
+#   make bitstream                the default, examples/design/blinky.mk
+#   make bitstream DESIGN=sketch  the smallest one, and the one to copy
 #
 # PMOD says which header the SD module is plugged into: JA (the default, upper
 # left), JB or JC (the right edge). Only the pin constraints change, so this is a
@@ -20,35 +18,40 @@ PMOD        ?= JA
 PART        ?= xc7a35tcpg236-1
 BOARD       ?= basys3
 
-# The Haskell module, the name its Synthesize annotation gives the top entity, the
-# pin constraints it needs, and where its output goes. XDC is a list:
-# syn/openxc7.mk passes each file to nextpnr as its own --xdc. OUT_NAME keeps each
-# combination's bitstream separate, because nothing in a .bit says which pins it
-# was built for -- and a bitstream for the wrong header looks exactly like a card
-# that will not answer.
-ifeq ($(DESIGN),blinky)
-  TOP_MODULE ?= Blinky
-  TOP_ENTITY ?= blinky
-  XDC        ?= constraints/Basys3.xdc
-  OUT_NAME   ?= blinky
-else ifeq ($(DESIGN),sd)
-  TOP_MODULE ?= SdDemo
-  TOP_ENTITY ?= sddemo
-  PMOD_XDC   := constraints/PmodSD-$(PMOD).xdc
-  ifeq ($(wildcard $(PMOD_XDC)),)
-    $(error No constraints for PMOD '$(PMOD)' -- expected $(PMOD_XDC))
-  endif
-  XDC        ?= constraints/Basys3.xdc constraints/PmodSD.xdc $(PMOD_XDC)
-  OUT_NAME   ?= sd-$(PMOD)
-else ifeq ($(DESIGN),io)
-  TOP_MODULE ?= IoDemo
-  TOP_ENTITY ?= iodemo
-  XDC        ?= constraints/Basys3.xdc constraints/Basys3-Inputs.xdc \
-                constraints/Basys3-Uart.xdc
-  OUT_NAME   ?= io
-else
-  $(error Unknown DESIGN '$(DESIGN)' -- use 'blinky', 'sd' or 'io')
+# One file per design under examples/design/, which is what makes adding a design
+# adding files rather than editing this one: a new design is examples/src/Foo.hs
+# and examples/design/foo.mk, and every target here then works on it. The list of
+# designs is the directory listing, so nothing has to be kept in step by hand --
+# including `make designs` and the error below.
+DESIGN_DIR  := examples/design
+DESIGN_MK   := $(DESIGN_DIR)/$(DESIGN).mk
+DESIGNS     := $(sort $(basename $(notdir $(wildcard $(DESIGN_DIR)/*.mk))))
+
+ifeq ($(wildcard $(DESIGN_MK)),)
+  $(error Unknown DESIGN '$(DESIGN)' -- expected $(DESIGN_MK). Have: $(DESIGNS))
 endif
+
+# What a design file sets: TOP_MODULE, the Haskell module; TOP_ENTITY, the name its
+# Synthesize annotation gives the generated HDL; XDC, the pin constraints it needs;
+# and optionally OUT_NAME and DESCRIPTION.
+#
+# XDC is a list -- syn/openxc7.mk passes each file to nextpnr as its own --xdc.
+# One file per group of pins, so the list reads as the same information as the
+# design's Synthesize annotation, in the same order. Getting it wrong is caught in
+# one direction only: a port with no constraint fails late, when nextpnr writes
+# FASM, with "port X of type PAD has no IOSTANDARD property", while a constraint
+# for a port the design does not have is silently ignored. So a missing file is an
+# error and a spare one is not, which is the safe way round but worth knowing.
+#
+# TOP_ENTITY is spelt out rather than derived from TOP_MODULE by lowercasing it.
+# It happens to be the lower-case module name in every design here, but that is a
+# convention in the Synthesize annotations, not a rule: the string in `basys3
+# "sketch"` is the design's to choose, and deriving it would turn a rename into a
+# silent mismatch.
+include $(DESIGN_MK)
+
+# Where the output goes. Separate per design, and sd.mk extends it with the header.
+OUT_NAME    ?= $(DESIGN)
 
 # `make monitor` opens a serial terminal on the board's USB-UART. screen ships
 # with macOS, which is the whole reason it is the default: this target exists to
@@ -122,22 +125,42 @@ WAVE_CMDS   ?= -c test/surfer-commands.txt
 VCD         := $(SIM_DIR)/testBench.vcd
 
 .DEFAULT_GOAL := help
-.PHONY: help build test repl verilog sim waves lint \
+.PHONY: help designs describe build test repl verilog sim waves lint \
         openxc7-image bitstream flash flash-persist monitor clean distclean
 
 help: ## Show this help
+	@# MAKEFILE_LIST includes the design file this run included, which would put
+	@# its comments in the output. Only this file has ## markers, so grep over
+	@# $(MAKEFILE_LIST) stays correct -- but `make designs` is the one to read for
+	@# what the designs are.
 	@grep -hE '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) \
 	  | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
 
+designs: ## List the designs DESIGN can name, with what each one does
+	@# Each design's own file is asked what it is, rather than this target holding a
+	@# second copy of the list that could go stale.
+	@for d in $(DESIGNS); do \
+	  what=$$($(MAKE) --no-print-directory -s describe DESIGN=$$d); \
+	  if [ "$$d" = "$(DESIGN)" ]; then mark='*'; else mark=' '; fi; \
+	  printf "%s \033[36m%-8s\033[0m %s\n" "$$mark" "$$d" "$$what"; \
+	done
+	@echo "  (* is the current DESIGN; override with DESIGN=<name>)"
+
+describe:
+	@echo '$(DESCRIPTION)'
+
 build: ## Compile the Haskell/Clash sources (first run also builds the Clash compiler)
-	@# --test --no-run-tests so a plain `make build` type-checks the test suite as
-	@# well as the library, without waiting for it to run.
+	@# --test --no-run-tests so a plain `make build` type-checks both test suites as
+	@# well as the two libraries, without waiting for them to run.
 	$(STACK) build --test --no-run-tests
 
 test: ## Haskell-level simulation -- fast, needs no HDL simulator
+	@# Both suites: the library's own (spec/) and the designs' (examples/test/).
+	@# `stack test basys3` is the first of them alone, which is the one to run after
+	@# moving the snapshot pin.
 	$(STACK) test
 
-repl: ## Interactive Clash REPL (try: sampleN @System 20 (withClockResetEnable clockGen resetGen enableGen (blinky 2 100)))
+repl: ## Interactive Clash REPL (try: sampleN @System 20 (withClockResetEnable clockGen resetGen enableGen (blinky 2)))
 	$(STACK) --silent run clashi -- examples/src/$(TOP_MODULE).hs
 
 verilog: $(VERILOG_TOP) ## Generate Verilog into verilog/
@@ -155,7 +178,7 @@ $(VERILOG_TOP): $(HS_SOURCES)
 sim: verilog ## RTL simulation of the generated test bench with Icarus Verilog
 	@# Only the blinky design has a TestBench annotation, so only it generates a
 	@# test bench to simulate. The SD controller is exercised in `make test`
-	@# instead, against a simulated card in Haskell (test/Pmod/FakeSdCard.hs).
+	@# instead, against a simulated card in Haskell (src/Pmod/FakeSdCard.hs).
 	@test -d $(TB_DIR) || { echo "No generated test bench for DESIGN=$(DESIGN)."; exit 1; }
 	@mkdir -p $(SIM_DIR)
 	@# test/dump.v is a second root module: Clash emits no $dumpvars, so this is
@@ -186,8 +209,9 @@ bitstream: $(BITSTREAM) ## Place, route and write the bitstream inside the toolc
 # The .xdc files are prerequisites as much as the HDL is: a pin change produces a
 # different bitstream from identical Verilog, and nothing in a .bit says which
 # constraints built it. syn/openxc7.mk is in there for the same reason -- it holds
-# the yosys and nextpnr invocations.
-$(BITSTREAM): $(VERILOG_TOP) $(XDC) syn/openxc7.mk
+# the yosys and nextpnr invocations, and $(DESIGN_MK) because it is what names the
+# constraints: dropping an .xdc from a design's list has to rebuild it too.
+$(BITSTREAM): $(VERILOG_TOP) $(XDC) $(DESIGN_MK) syn/openxc7.mk
 	@$(CONTAINER) image exists $(OPENXC7_IMAGE) \
 	  || { echo "No $(OPENXC7_IMAGE) image -- run 'make openxc7-image' first."; exit 1; }
 	$(CONTAINER) run --rm -v $(CURDIR):/work -w /work $(OPENXC7_IMAGE) \

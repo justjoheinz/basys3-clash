@@ -43,25 +43,16 @@ the switches to a value, press btnR, and the display should read what the LEDs
 are showing -- and the host is told the same value, so btnR doubles as "send me
 the switches".
 -}
-module IoDemo
+module Io
   ( Typed (..)
   , greeting
-  , ioDemo
+  , io
   , topEntity
   , typedAs
   , word
   ) where
 
-import Clash.Prelude
-
-import Ascii                   (ascii, hex, hexNibble, line)
-import Basys3                  (Basys3, Leds, Settle, Switches, baud115200,
-                                prescaler, settle)
-import Control.Monad           ((>=>))
-import Peripheral.Button       (bank, contact)
-import Peripheral.SevenSegment (display, hexDigits)
-import Serial                  (UartRx (..), atReset, before, report, say,
-                                serial)
+import Basys3.Board
 
 -- | What the board says when it comes out of reset. Exported so the tests can
 -- derive both the bytes they expect and how long they take to leave, rather than
@@ -104,9 +95,9 @@ typedAs c
   | otherwise              = Digit <$> hexNibble c
 
 -- | The design. The two cycle counts and the bit period are parameters for the
--- same reason 'Blinky.blinky''s are: a five-millisecond debounce is 500e3 cycles
--- and one UART bit is 868, neither of which a test wants to simulate.
-ioDemo
+-- same reason 'Blinky.blinky''s period is: a five-millisecond debounce is 500e3
+-- cycles and one UART bit is 868, neither of which a test wants to simulate.
+io
   :: forall dom
    . HiddenClockResetEnable dom
   => Unsigned 32
@@ -121,20 +112,21 @@ ioDemo
   -> Signal dom Bit  -- ^ btnL, clear
   -> Signal dom Bit  -- ^ btnR, load the switches
   -> Signal dom Bit  -- ^ uart_rx, the line from the host
-  -> Signal dom (Leds, BitVector 7, BitVector 4, Bit, Bit)
-ioDemo contacts dwell period sw up down left right rxPin =
-  bundle (leds, seg, anode, point, uartOut)
+  -> Signal dom (Leds, Display, Bit)
+-- 'hold' rather than 'dwell' and 'held'/'press' rather than 'pressed': the board's
+-- names for all three are in scope through "Basys3.Board", and this circuit takes
+-- its own timings precisely so as not to use them.
+io contacts hold period sw up down left right rxPin =
+  bundle (leds, Display <$> seg <*> anode <*> point, uartOut)
  where
   -- The switches, debounced, straight onto the LEDs.
   leds = bank contacts sw
 
-  -- One pulse per press. Annotated rather than pattern-matched out of 'contact'
-  -- so the domain stays tied to this signature under MonoLocalBinds.
-  pressed :: Signal dom Bit -> Signal dom Bool
-  pressed = snd . contact contacts
+  -- One pulse per press.
+  press = snd . contact contacts
 
   count  = register 0 (bump <$> count <*> inputs)
-  inputs = bundle (pressed left, pressed right, pressed up, pressed down, leds, typed)
+  inputs = bundle (press left, press right, press up, press down, leds, typed)
 
   -- Clear beats load beats up beats down beats the host, so pressing two things
   -- at once is defined rather than merely whatever the hardware happens to do.
@@ -155,7 +147,7 @@ ioDemo contacts dwell period sw up down left right rxPin =
     | Just (Digit d) <- asked = shiftL c 4 .|. zeroExtend (pack d)
     | otherwise               = c
 
-  (seg, anode) = display (prescaler dwell) (hexDigits <$> count)
+  (seg, anode) = display (prescaler hold) (hexDigits <$> count)
 
   -- The host link, both directions. Two things talk: the greeting, once, and
   -- the counter reports for ever after. 'Serial.before' is the whole of the
@@ -167,19 +159,19 @@ ioDemo contacts dwell period sw up down left right rxPin =
   -- by the cycle it arrives on or not at all.
   (uartOut, heard) = serial period rxPin
                        (say greeting atReset `before` report word count)
-  typed = (rxByte >=> typedAs) <$> heard
+  typed = decoded typedAs heard
 
   -- A framing error is one cycle wide and means the far end is running at a
-  -- different speed, so latch it: the decimal point is active low like the rest
+  -- different speed, so 'latch' it: the decimal point is active low like the rest
   -- of the display, hence the 'not'.
-  faulty = register False ((rxError <$> heard) .||. faulty)
+  faulty = latch (rxError <$> heard)
   point  = boolToBit . not <$> faulty
 
 -- | 'Basys3.settle' is 5 ms, long enough for any of these contacts to stop
 -- bouncing. Each display digit is held for 100e3 cycles (1 ms), giving a 250 Hz
 -- refresh, as in the other designs, and the host link runs at 115200 baud.
 --
--- btnC gets the same 5 ms through 'resetGlitchFilter', for the reason
+-- btnC gets the same 5 ms through 'Basys3.onBoard', for the reason
 -- 'Basys3.settle' gives -- and this is the design where the difference is
 -- audible rather than theoretical. An undebounced reset restarts the domain once
 -- per bounce, and each restart lands in the middle of whichever frame was on the
@@ -198,28 +190,11 @@ topEntity
   -> Signal Basys3 Bit
   -> Signal Basys3 Bit
   -> Signal Basys3 Bit
-  -> Signal Basys3 (Leds, BitVector 7, BitVector 4, Bit, Bit)
+  -> Signal Basys3 (Leds, Display, Bit)
 topEntity clk rst sw up down left right rxPin =
-  withClockResetEnable clk (resetGlitchFilter (SNat @Settle) clk rst) enableGen
-    (ioDemo settle 99_999 baud115200 sw up down left right rxPin)
+  onBoard clk rst (io settle 99_999 baud115200 sw up down left right rxPin)
 {-# NOINLINE topEntity #-}
 {-# ANN topEntity
-  (Synthesize
-    { t_name   = "iodemo"
-    , t_inputs = [ PortName "clk"
-                 , PortName "rst"
-                 , PortName "sw"
-                 , PortName "btnU"
-                 , PortName "btnD"
-                 , PortName "btnL"
-                 , PortName "btnR"
-                 , PortName "uart_rx"
-                 ]
-    , t_output = PortProduct ""
-                   [ PortName "led"
-                   , PortName "seg"
-                   , PortName "an"
-                   , PortName "dp"
-                   , PortName "uart_tx"
-                   ]
-    }) #-}
+  (basys3 "io"
+    (switchesPort : buttonPorts <> [uartRxPort])
+    (ports [ledsPort, displayPort, uartTxPort])) #-}

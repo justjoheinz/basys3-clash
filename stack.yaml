@@ -17,9 +17,11 @@
 # pin, check clash-prelude's `tested-with` against the snapshot's compiler.
 snapshot: nightly-2026-09-24
 
-# blinky is the library, blinky-examples the designs built on it plus the Clash
-# driver and the test suite. The edge only runs one way, and Stack is what enforces
-# it: an import of a design from src/ cannot resolve.
+# basys3 is the library, basys3-examples the designs built on it plus the Clash
+# driver. Each has its own test suite -- `stack test basys3` is the library on its
+# own, which is the useful thing to run after moving the pin above. The dependency
+# edge only runs one way, and Stack is what enforces it: an import of a design from
+# src/ cannot resolve.
 packages:
   - .
   - examples
