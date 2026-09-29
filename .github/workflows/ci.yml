@@ -93,7 +93,7 @@ jobs:
         run: stack build basys3 --test --no-run-tests
 
       # spec/ -- the UART's frames, the debouncer, base ten, the SD controller
-      # against Pmod.FakeSdCard. Nothing here has a topEntity or a pin.
+      # against spec/FakeSdCard.hs. Nothing here has a topEntity or a pin.
       - name: Test the library
         run: stack test basys3
 

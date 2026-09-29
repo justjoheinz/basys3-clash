@@ -9,10 +9,16 @@
 -- a sequencer on a real transmitter, a controller against a pretend card, a format
 -- compared against plain 'P.Integer' arithmetic. The @examples@ package's suite is
 -- the other half, and it covers what the designs do with all of this.
+--
+-- The two parts those checks talk to -- "FakeSdCard" and "FakeTmp2" -- are in this
+-- directory rather than in @src\/@ because they are test code: a library that ships
+-- a double of a part no design contains is shipping a fixture. They are therefore
+-- this suite's alone, and a design's suite next door cannot see them.
 module Main (main) where
 
 import           Clash.Prelude
 import           Control.Monad           (unless)
+import           Data.List               (group, groupBy, nub)
 import           Data.Maybe              (mapMaybe)
 import qualified Prelude                 as P
 import           System.Exit             (exitFailure)
@@ -21,11 +27,15 @@ import           Ascii                   (ascii, dec, decDigits, hex, hexChar,
                                           hexNibble, line)
 import           Basys3                  (baud115200, dwell, prescaler, settle,
                                           vBasys3)
+import           FakeSdCard              (fakeCard, sectorByte)
+import           FakeTmp2                (celsius, fakeTmp2, reading, tmp2Address,
+                                          tmp2Id)
 import           Latch                   (latch)
 import           Peripheral.Button       (bank, contact, falling)
 import           Peripheral.SevenSegment (hexDigits, sevenSeg)
-import           Pmod.FakeSdCard         (fakeCard, sectorByte)
 import           Pmod.SdCard             (SdOut (..), Stage (..), frameFor, sdCard)
+import           Protocol.I2C            (I2cOp (..), I2cOut (..), I2cReply (..),
+                                          addressFor, i2cMaster, openDrain)
 import           Protocol.SPI            (SpiOut (..), spiMaster)
 import           Protocol.UART           (UartRx (..), UartTx (..), uartRx, uartTx)
 import           Serial                  (Source, atReset, before, decoded, report,
@@ -328,6 +338,231 @@ restarts = P.length
   [() | (a, b) <- P.zip deadTrace (P.drop 1 deadTrace)
       , sdStage a == Failed, sdStage b /= Failed]
 
+-- * The I2C bus
+
+-- | The quarter bit period the bus below runs at, as 'i2cMaster' wants it, which
+-- is cycles minus one. Two is the documented minimum and so the interesting one:
+-- the sample point is a quarter period after SCL is released, and the master's
+-- input synchronisers eat two cycles of that.
+i2cQuarter :: Unsigned 16
+i2cQuarter = 2
+
+-- | The same number as cycles, which is what the timing checks count in.
+i2cCycles :: P.Int
+i2cCycles = P.fromIntegral i2cQuarter P.+ 1
+
+-- | What a logic analyser clipped to the two wires would report: the two
+-- conditions, and a bit, being SDA at the moment SCL rises.
+--
+-- Nothing here knows about bytes. That every ninth bit is an acknowledge is what
+-- the checks assert, not something the decoder assumes -- so a master that put
+-- eight bits or ten on the wire would fail rather than be tidied up.
+data Wire = Began | Ended | Sent Bit
+  deriving (P.Eq, P.Show)
+
+-- | Read a trace of @(SCL, SDA)@ back as what happened on it.
+--
+-- One event per stretch of SCL being high, which is what makes a condition
+-- distinguishable from a bit at all: SDA holding still through a high period is a
+-- bit, and SDA moving during one is a START if it fell and a STOP if it rose.
+-- Counting rising edges instead would report the clock a condition needs as a
+-- tenth bit of the byte before it.
+decode :: [(Bit, Bit)] -> [Wire]
+decode = mapMaybe event . groupBy sameScl
+ where
+  sameScl a b = P.fst a == P.fst b
+  -- A group is one stretch of SCL at one level. The low ones say nothing.
+  event g = case g of
+    (scl, opening) : _ | scl == high -> Just (told opening (P.snd (P.last g)))
+    _                                -> Nothing
+  told opening closing
+    | opening == closing = Sent opening
+    | closing == low     = Began
+    | P.otherwise        = Ended
+
+-- | A byte as the decoder should see it: eight bits most significant first --
+-- which is the opposite of "Protocol.UART" and the same as "Protocol.SPI" -- and
+-- then the acknowledge, whichever end drove it.
+onWire :: BitVector 8 -> Bit -> [Wire]
+onWire b ack = [Sent (if testBit b k then high else low) | k <- [7, 6 .. 0]] P.++ [Sent ack]
+
+-- | Run lengths, which is how the timing checks measure SCL without counting
+-- cycles by hand.
+runs :: [Bit] -> [(Bit, P.Int)]
+runs = mapMaybe measure . group
+ where
+  -- 'group' never hands back an empty list, so the second case is unreachable.
+  -- It is here because 'P.head' is a warning and this is not.
+  measure g = case g of
+    b : _ -> Just (b, P.length g)
+    []    -> Nothing
+
+-- | Hand the master one operation at a time, the next whenever it says it is
+-- free. Every script below ends in a 'Nothing' and that is what happens after
+-- the last operation: the index saturates on it, so the bus is left exactly as
+-- the script left it.
+script
+  :: forall n dom
+   . (HiddenClockResetEnable dom, KnownNat n, 1 <= n)
+  => Vec n (Maybe I2cOp)
+  -> Signal dom Bool
+  -> Signal dom (Maybe I2cOp)
+script ops free = (ops !!) <$> which
+ where
+  which = register (0 :: Index n) (mux more (satSucc SatBound <$> which) which)
+  more  = (\f i -> f && i /= maxBound) <$> free <*> which
+
+-- | A bus: the master working through a script, a pull-up on each line, and
+-- whatever else is pulling them down.
+--
+-- Nothing drives either line high. A line is high when nobody is holding it low,
+-- which is the whole of open drain and the reason 'i2cMaster' reports @Low@ flags
+-- rather than levels -- so the model of the wire is one 'not' of a disjunction,
+-- and a test can add a second device by adding a term to it.
+i2cBus
+  :: (HiddenClockResetEnable dom, KnownNat n, 1 <= n)
+  => Vec n (Maybe I2cOp)
+  -> (Signal dom Bit -> Signal dom Bool)
+  -- ^ Something else pulling SCL low, given SCL: a target stretching the clock.
+  -> (Signal dom (Bit, Bit) -> Signal dom Bool)
+  -- ^ Something else pulling SDA low, given both lines: a target answering.
+  -> Signal dom ((Bit, Bit), Maybe I2cReply)
+i2cBus ops onScl onSda = bundle (wire, i2cDone <$> out)
+ where
+  out  = i2cMaster i2cQuarter (script ops (i2cIdle <$> out)) scl sda
+  wire = bundle (scl, sda)
+  scl  = pulled <$> onScl scl <*> (i2cSclLow <$> out)
+  sda  = pulled <$> onSda wire <*> (i2cSdaLow <$> out)
+  pulled them us = boolToBit (not (them || us))
+
+-- | A target that stretches the clock: it takes hold of SCL the first time it
+-- sees the line low -- the only time a target can, there being nothing to grab
+-- while it is high -- and holds it down for a hundred cycles.
+--
+-- That lands on the master's first data bit, which has released SCL and is
+-- waiting for it to come up. None of the wait may count as clock.
+stretcher :: HiddenClockResetEnable dom => Signal dom Bit -> Signal dom Bool
+stretcher = moore step (\(_, held) -> held P.> 0) (False, 0 :: Unsigned 16)
+ where
+  step (done, held) scl
+    | held P.> 0  = (done, held - 1)
+    | done        = (True, 0)
+    | scl == low  = (True, 100)
+    | P.otherwise = (False, 0)
+
+-- | A byte a master would send to address the pretend sensor, and the byte it
+-- has to be: seven bits of address and then the direction.
+sensorWrite, sensorRead :: BitVector 8
+sensorWrite = addressFor tmp2Address False
+sensorRead  = addressFor tmp2Address True
+
+-- | The temperature the sensor reports below. Not a whole number of degrees and
+-- not a power of two of a sixteenth, so a master that dropped the low half or
+-- shifted either of them wrongly would not land on it by luck.
+mild :: Signed 16
+mild = celsius 23 9                 -- 23.5625 °C
+
+-- | And a temperature below the part's @T_LOW@ setpoint, which is what makes it
+-- set a flag.
+freezing :: Signed 16
+freezing = celsius (-3) (-4)        -- -3.25 °C
+
+-- | Three operations on an empty bus: a START, an address byte asking to read,
+-- and a STOP. Nothing is out there, so the acknowledge reads high -- an
+-- open-drain line with nobody on it is the whole of how an absent device
+-- announces itself.
+emptyBus :: [((Bit, Bit), Maybe I2cReply)]
+emptyBus = sampleN 400
+  (withClockResetEnable clockGen resetGen enableGen
+     (i2cBus (Just Start :> Just (Write (addressFor 0x48 True)) :> Just Stop :> Nothing :> Nil)
+             (const (pure False)) (const (pure False))
+        :: Signal System ((Bit, Bit), Maybe I2cReply)))
+
+-- | The same again with a target holding SCL down across the first bit.
+stretchedBus :: [((Bit, Bit), Maybe I2cReply)]
+stretchedBus = sampleN 600
+  (withClockResetEnable clockGen resetGen enableGen
+     (i2cBus (Just Start :> Just (Write (addressFor 0x48 True)) :> Just Stop :> Nothing :> Nil)
+             stretcher (const (pure False))
+        :: Signal System ((Bit, Bit), Maybe I2cReply)))
+
+-- | The pretend sensor on the bus, answering to the address its jumpers came
+-- set to. Nothing pulls SCL down: the real part does not stretch the clock.
+withSensor
+  :: (HiddenClockResetEnable dom, KnownNat n, 1 <= n)
+  => Signed 16
+  -> Vec n (Maybe I2cOp)
+  -> Signal dom ((Bit, Bit), Maybe I2cReply)
+withSensor temperature ops =
+  i2cBus ops (const (pure False)) (fakeTmp2 tmp2Address (pure temperature))
+
+-- | Write the address pointer, then read the two halves of the temperature
+-- register back without letting go of the bus. This is the shape almost every
+-- I2C part wants and the only thing a repeated START is for, and it is a real
+-- exchange with a model of a real part rather than a loopback: the sensor
+-- answers because the address matched, and says the second byte because the
+-- pointer stepped on by itself.
+sensorBus :: [((Bit, Bit), Maybe I2cReply)]
+sensorBus = sampleN 1600
+  (withClockResetEnable clockGen resetGen enableGen
+     (withSensor mild
+        (  Just Start :> Just (Write sensorWrite) :> Just (Write 0x00)
+        :> Just Start :> Just (Write sensorRead)
+        :> Just (Read True) :> Just (Read False) :> Just Stop :> Nothing :> Nil )
+        :: Signal System ((Bit, Bit), Maybe I2cReply)))
+
+-- | A cold sensor, and one byte more: the status register straight after the
+-- temperature, the pointer having walked there on its own.
+coldBus :: [((Bit, Bit), Maybe I2cReply)]
+coldBus = sampleN 1600
+  (withClockResetEnable clockGen resetGen enableGen
+     (withSensor freezing
+        (  Just Start :> Just (Write sensorWrite) :> Just (Write 0x00)
+        :> Just Start :> Just (Write sensorRead)
+        :> Just (Read True) :> Just (Read True) :> Just (Read False)
+        :> Just Stop :> Nothing :> Nil )
+        :: Signal System ((Bit, Bit), Maybe I2cReply)))
+
+-- | Reading the ID register, which is how a driver finds out what it is talking
+-- to -- and in two transactions rather than one, the bus being let go of in
+-- between. That the address pointer survives a STOP is what makes this work, and
+-- most drivers are written this way.
+identifiedBus :: [((Bit, Bit), Maybe I2cReply)]
+identifiedBus = sampleN 1600
+  (withClockResetEnable clockGen resetGen enableGen
+     (withSensor mild
+        (  Just Start :> Just (Write sensorWrite) :> Just (Write 0x0B) :> Just Stop
+        :> Just Start :> Just (Write sensorRead) :> Just (Read False) :> Just Stop
+        :> Nothing :> Nil )
+        :: Signal System ((Bit, Bit), Maybe I2cReply)))
+
+-- | The same sensor asked for by an address its jumpers are not on. It says
+-- nothing whatever, which is indistinguishable from an empty header -- and is
+-- exactly how a driver discovers one.
+elsewhereBus :: [((Bit, Bit), Maybe I2cReply)]
+elsewhereBus = sampleN 400
+  (withClockResetEnable clockGen resetGen enableGen
+     (withSensor mild
+        (  Just Start :> Just (Write (addressFor 0x48 False)) :> Just Stop
+        :> Nothing :> Nil )
+        :: Signal System ((Bit, Bit), Maybe I2cReply)))
+
+-- | What the two wires did, and what the master made of it.
+onBus :: [((Bit, Bit), Maybe I2cReply)] -> [Wire]
+onBus = decode . P.map P.fst
+
+replies :: [((Bit, Bit), Maybe I2cReply)] -> [I2cReply]
+replies = mapMaybe P.snd
+
+-- | Just the bytes a read got back, which is what a driver would be left
+-- holding.
+fetched :: [((Bit, Bit), Maybe I2cReply)] -> [BitVector 8]
+fetched samples = [b | Fetched b <- replies samples]
+
+-- | How long SCL stayed at @level@, run by run.
+sclRuns :: [((Bit, Bit), Maybe I2cReply)] -> Bit -> [P.Int]
+sclRuns samples level = [n | (b, n) <- runs [s | ((s, _), _) <- samples], b == level]
+
 check :: (P.Eq a, P.Show a) => P.String -> [a] -> [a] -> P.IO Bool
 check name expected actual
   | actual P.== expected = do
@@ -509,6 +744,86 @@ main = do
   -- And does not stay given up: a card inserted later must be picked up.
   retryOk <- check "giving up starts another attempt" [True] [restarts P.>= 2]
 
+  -- I2C, and the thing about it no output of the master's own can tell you: what
+  -- the two wires actually did. 'decode' reads them the way a logic analyser
+  -- would, so the expected value is the waveform -- and a data bit that moved
+  -- while SCL was high would come back as a stray START rather than as a bit.
+  wireOk  <- check "a byte on an empty bus is a START, nine bits and a STOP"
+               ([Began] P.++ onWire 0x91 high P.++ [Ended]) (onBus emptyBus)
+  saidOk  <- check "and the master reports the two conditions and no acknowledgement"
+               [Framed, Acked False, Framed] (replies emptyBus)
+  -- 50% duty, and the two extra cycles are the point rather than a rounding:
+  -- the high period is timed from the cycle SCL reads high, so the pull-up's
+  -- rise and the master's two input synchronisers are added to the bit instead
+  -- of taken out of it.
+  highOk  <- check "every high period is two quarters plus the synchronisers"
+               [[2 P.* i2cCycles P.+ 2]]
+               [nub (P.take 9 (P.drop 1 (sclRuns emptyBus high)))]
+  lowOk   <- check "and every low period inside a byte is two quarters"
+               [[2 P.* i2cCycles]]
+               [nub (P.take 8 (P.drop 1 (sclRuns emptyBus low)))]
+
+  -- A target holding SCL down after the master released it. None of that may
+  -- count as clock, so the byte comes out identical and the high periods are
+  -- untouched; exactly one low period got much longer, which is what the second
+  -- half of this checks -- without it a master that ignored SCL entirely would
+  -- pass.
+  heldOk  <- check "a stretched clock changes what is on the wire not at all"
+               (onBus emptyBus) (onBus stretchedBus)
+  keptOk  <- check "and steals nothing from the high periods"
+               [([2 P.* i2cCycles P.+ 2], True)]
+               [( nub (P.take 9 (P.drop 1 (sclRuns stretchedBus high)))
+                , P.maximum (sclRuns stretchedBus low) P.> 50 )]
+
+  -- One transaction with the pretend sensor: five bytes, both directions, and the
+  -- repeated START that turns the first half into the second. This is the only
+  -- check that produces an 'Acked' 'True' or a 'Fetched' at all, an empty bus
+  -- being unable to.
+  talkOk  <- check "a write and a read in one transaction come back byte for byte"
+               [ Framed, Acked True, Acked True
+               , Framed, Acked True, Fetched 0x0B, Fetched 0xC8, Framed ]
+               (replies sensorBus)
+  -- The same transaction from the wire's side, which is where the acknowledges
+  -- are visible: low for the four the receiving end sent, high for the NACK that
+  -- tells the sensor the master wants no more.
+  bytesOk <- check "and the wire shows who acknowledged what"
+               (  [Began] P.++ onWire sensorWrite low
+                          P.++ onWire 0x00 low
+               P.++ [Began] P.++ onWire sensorRead low
+                          P.++ onWire 0x0B low
+                          P.++ onWire 0xC8 high
+               P.++ [Ended] )
+               (onBus sensorBus)
+  -- And what those two bytes mean, which is the only thing a driver cares about:
+  -- thirteen bits of temperature with the flags under them.
+  tempOk  <- check "the two halves are the temperature the sensor was given"
+               [mild] [reading 0x0B 0xC8]
+
+  -- Below T_LOW the part raises a flag, in the bottom bit of the temperature
+  -- register and again in the status register four bits up -- and the status
+  -- register arrives because the pointer walked to it, three bytes into a read
+  -- that only ever named one address.
+  coldOk  <- check "a cold sensor flags T_LOW in both registers, and the pointer walks"
+               [[0xFE, 0x61, 0x10]] [fetched coldBus]
+  chillOk <- check "and the reading survives the flag, and the sign"
+               [freezing] [reading 0xFE 0x61]
+
+  -- Two transactions, the bus released in between, and the pointer written by
+  -- the first still there for the second.
+  idOk    <- check "the address pointer survives a STOP"
+               [tmp2Id] (fetched identifiedBus)
+  -- Nothing answers for an address nobody is on, and the sensor is the same
+  -- sensor: this is the check that says its address matching is real rather than
+  -- a fake that acknowledges whatever it hears.
+  deafOk  <- check "a sensor at another address is indistinguishable from none"
+               [([Framed, Acked False, Framed], [Began] P.++ onWire 0x90 high P.++ [Ended])]
+               [(replies elsewhereBus, onBus elsewhereBus)]
+
+  addrOk  <- check "an address byte is seven bits and the direction"
+               [0x96, 0x97] [sensorWrite, sensorRead]
+  drainOk <- check "an open-drain output releases the line or drives zero, never one"
+               [Nothing, Just 0] [openDrain False, openDrain True]
+
   unless (P.and [ timingOk, tickOk, latchOk
                 , segOk, hexOk, splitOk
                 , pressOk, quietOk, bankOk
@@ -518,4 +833,7 @@ main = do
                 , sayOk, doneOk, freezeOk, mergeOk, firstOk, orderOk, quietSrcOk
                 , crcOk, echoOk, readyOk, failOk, ocrOk, idxOk, dataOk, sigOk
                 , deadOk, retryOk
+                , wireOk, saidOk, highOk, lowOk, heldOk, keptOk
+                , talkOk, bytesOk, tempOk, coldOk, chillOk, idOk, deafOk
+                , addrOk, drainOk
                 ]) exitFailure
