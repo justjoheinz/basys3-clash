@@ -1302,7 +1302,7 @@ package, and the GHC session inside `clash` cannot load a module out of it.
 | `syn/openxc7.Containerfile` | Native arm64 image with yosys, nextpnr-xilinx and prjxray |
 | `syn/openxc7.mk` | The bitstream flow, run inside that image |
 | `test/dump.v` | `$dumpvars` root module, compiled in so `make sim` writes a VCD |
-| `test/verilator.vlt` | One documented lint waiver, over all generated top entities, for Clash's 64-bit vector indices |
+| `test/verilator.vlt` | Two documented lint waivers, over all generated top entities: Clash's 64-bit vector indices, and a `foldl`'s intermediates on one wire |
 | `test/surfer-commands.txt` | Signals Surfer preselects when opening the generated test bench's waveform |
 | `examples/bin/Clash.hs`, `examples/bin/Clashi.hs` | Entry points so `stack run clash` / `clashi` can see the designs |
 
@@ -1322,7 +1322,7 @@ Three directories have tests in them, and each answers a different question:
   in another package. What `sd` puts on its LEDs and display is unchecked; the
   controller under it is `spec/`'s business.
 - `test/` — no Haskell at all. Fixtures for Verilator and Icarus, which read Verilog:
-  the `$dumpvars` module `make sim` compiles in, the one lint waiver, and the signal
+  the `$dumpvars` module `make sim` compiles in, the lint waivers, and the signal
   list Surfer opens with.
 
 `check`, and a frame-builder and a report-speller with it, are the same few lines in
