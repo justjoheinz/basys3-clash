@@ -4,7 +4,13 @@
 #   make bitstream        # use it
 #
 # Podman builds this for the host's own CPU, so on Apple Silicon it is a genuine
-# arm64 image: no Rosetta, no qemu, no x86 anywhere in the flow.
+# arm64 image: no Rosetta, no qemu, no x86 anywhere in that flow.
+#
+# Nothing below pins an architecture -- the base image is a multi-arch manifest and
+# the Nix expressions ask for builtins.currentSystem -- so the same file gives an
+# x86_64-linux toolchain when CI builds it on a Linux runner. Neither build emulates
+# anything; each is native to the machine that ran it. The registry tag carries the
+# architecture to keep the two apart; see .github/workflows/toolchain-image.yml.
 #
 # openXC7 is distributed as a Nix flake, so Nix runs *inside* this image. It is
 # not installed on the Mac, and `podman rmi` removes every trace.

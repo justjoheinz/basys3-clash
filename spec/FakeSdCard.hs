@@ -10,15 +10,16 @@ promptly, never reports an error, and claims to be a high-capacity card. Timeout
 and error tokens are 'Pmod.SdCard''s problem, and the way to exercise those is to
 hold MISO high and watch the retry.
 
-__Why this ships with the library__ rather than sitting in a test directory: it is
-what makes an SD design testable without a card in the socket, which is a thing
-somebody writing their own controller wants and not only a thing this library's
-own tests want. It is also ordinary synthesisable Clash -- two of them and a
-controller would fit on the board -- so there is nothing here that a library has
-to keep out. It keeps the namespace of the module it stands in for, so the double
-sits next to the real thing.
+__Why this lives in @spec\/@__ rather than beside "Pmod.SdCard": it is test code.
+A library has no business shipping a double of a part nobody's design contains,
+and the fact that it is synthesisable Clash does not make it something a user of
+this library wants to link against. The cost of that is real and worth stating:
+it is visible only to the suite in this directory, so a design's own suite
+(@examples\/test\/@, another package) cannot drive a card with it, and neither can
+anybody writing their own controller on top of "Pmod.SdCard". Copy it if you need
+it there -- which is what @check@ and @frame@ already do across the same boundary.
 -}
-module Pmod.FakeSdCard
+module FakeSdCard
   ( fakeCard
   , sectorByte
   ) where

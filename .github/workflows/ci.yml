@@ -1,0 +1,137 @@
+# The library first, then the designs. Everything here needs no FPGA and no
+# synthesis toolchain -- Stack, plus iverilog and verilator from apt -- so this runs
+# on every push and warm it takes minutes.
+#
+# The library is the point of the repository and so it is checked on its own, before
+# anything that has a topEntity: `stack test basys3` answers whether basys3 works
+# with no design in scope, which is the question somebody bumping the snapshot is
+# asking. The designs follow because they cost nothing extra here and because they
+# are the only thing that carries the library's output as far as HDL.
+#
+# Place and route is bitstream.yml, which is manual: it needs the openXC7 container
+# image, and pin constraints and timing closure are properties of a design rather
+# than of the library. Worth running by hand after touching Ascii, though --
+# decDigits is library code and it is the critical path.
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  # Also on pull requests, which is what covers PRs from forks (their pushes are
+  # not to this repository). For a branch in this repo both trigger, so drop one
+  # if the duplicate runs are not worth the fork coverage.
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# A second push to the same branch makes the first run pointless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test, simulate, lint
+    runs-on: ubuntu-24.04
+    # The first run compiles clash-ghc from scratch. Cached runs are a fraction of
+    # this; the limit is here so an uncached run finishes rather than being killed.
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # Both are plain apt packages, which is the whole reason this job is cheap.
+      # The versions are echoed because they are the one thing here that drifts
+      # under us: test/verilator.vlt is written against 5.052 and apt is behind it,
+      # so a lint that fails only in CI is a version difference before it is a bug.
+      - name: Install the HDL tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends iverilog verilator
+          iverilog -V | head -1
+          verilator --version
+
+      # Stack only. GHC is the snapshot's business (stack.yaml has install-ghc:
+      # true), and letting the action install a second one would just cost cache.
+      - name: Install Stack
+        uses: haskell-actions/setup@v2
+        with:
+          enable-stack: true
+          stack-version: latest
+          stack-no-global: true
+
+      # The compiler and the snapshot's prebuilt packages. Keyed on the resolver
+      # and the package descriptions, since those are what decide the contents.
+      - name: Cache ~/.stack
+        uses: actions/cache@v4
+        with:
+          path: ~/.stack
+          key: stack-${{ runner.os }}-${{ hashFiles('stack.yaml.lock', 'package.yaml', 'examples/package.yaml', 'clash-common.yaml') }}
+          restore-keys: |
+            stack-${{ runner.os }}-
+
+      # This project's own object files, one directory per package. Restored from a
+      # prefix match so an ordinary source edit still gets an incremental build.
+      #
+      # If a package is ever renamed, a restored cache carries the old package
+      # registered in the project db and the build fails with "Ambiguous module
+      # name". Bump the v1 below to throw these away; see CLAUDE.md.
+      - name: Cache build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            .stack-work
+            examples/.stack-work
+          key: stack-work-v1-${{ runner.os }}-${{ hashFiles('src/**/*.hs', 'spec/*.hs', 'examples/src/*.hs', 'examples/test/*.hs', 'examples/bin/*.hs', '*.yaml', 'examples/*.yaml') }}
+          restore-keys: |
+            stack-work-v1-${{ runner.os }}-
+
+      # The library alone. Named its own step so a failure in it is not buried under
+      # a design's, and built with --test --no-run-tests so the step below is a
+      # failing check rather than a compile error.
+      - name: Build the library
+        run: stack build basys3 --test --no-run-tests
+
+      # spec/ -- the UART's frames, the debouncer, base ten, the SD controller
+      # against spec/FakeSdCard.hs. Nothing here has a topEntity or a pin.
+      - name: Test the library
+        run: stack test basys3
+
+      # The designs, after, and still cheap: the snapshot and the Clash driver are
+      # already built by now. They are what checks that the library's parts go
+      # together the way their haddock says.
+      - name: Build the designs
+        run: make build
+
+      - name: Test the designs
+        run: stack test basys3-examples
+
+      # Only blinky has a TestBench annotation, and `make sim` decides PASS/FAIL by
+      # grepping its own log -- vvp exits 0 even on a failed assertion. This is as
+      # far as the library's generated HDL can be exercised without a toolchain.
+      - name: Generated HDL test bench
+        run: make sim
+
+      # Every design, in one job rather than a matrix: each lint is a second, and a
+      # matrix would recompile the Clash driver once per design. The list comes from
+      # the directory for the same reason the Makefile does it that way.
+      - name: Lint every design
+        run: |
+          for mk in examples/design/*.mk; do
+            design=$(basename "$mk" .mk)
+            echo "::group::lint $design"
+            make lint DESIGN="$design"
+            echo "::endgroup::"
+          done
+
+      # The log and waveform of whatever just happened, so a CI-only failure can be
+      # looked at rather than guessed at.
+      - name: Keep the simulation output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: simulation
+          path: |
+            sim/testBench.log
+            sim/testBench.vcd
+          if-no-files-found: ignore

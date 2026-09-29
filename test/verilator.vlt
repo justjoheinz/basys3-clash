@@ -13,5 +13,21 @@
 // One glob over every generated top entity rather than a line per design: the
 // waiver is about how Clash indexes vectors, which is the same in all of them, and
 // a list would be one more place to remember when a design is added.
+// UNOPTFLAT is the same story with a version number on it. `Pmod.SdCard.crc7` is a
+// `foldl` over forty bits, which Clash emits as one 280-bit wire holding all forty
+// intermediate CRCs, written and read by the same generate loop:
+//
+//   assign ws        = {7'b0000000, ws1};   // the seed, then the intermediates
+//   assign c$vec2    = ws[287-1 : 7];       // shifted by one element
+//   assign ws1[i*7+:7] = f(c$vec2[i*7+:7], bit i);
+//
+// Element i depends on i-1 and nothing else, so the chain is acyclic -- but the
+// whole word appears in its own cone, and Verilator has to split it bit-range-wise
+// to see that. 5.052 does; the 5.020 that Ubuntu 24.04 ships does not, and reports
+// seven of these for `sd` alone. The warning is about Verilator's own eval-loop
+// scheduling and says nothing about synthesis: nextpnr routes this design and
+// closes timing on it. Waived rather than pinning a Verilator in CI, which would
+// cost a source build per run; revisit if apt ever catches up.
 `verilator_config
 lint_off -rule WIDTHTRUNC -file "*.topEntity/*.v"
+lint_off -rule UNOPTFLAT -file "*.topEntity/*.v"

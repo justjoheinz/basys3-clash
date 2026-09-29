@@ -453,13 +453,13 @@ applied rather than silently ignored.
 | --- | --- |
 | `Protocol.SPI` | A byte-at-a-time SPI mode-0 master. Knows nothing about SD — not even that a chip select exists. |
 | `Pmod.SdCard` | The protocol: CMD0, CMD8, CMD55/ACMD41, CMD58, CMD17, and the timeouts. |
-| `Pmod.FakeSdCard` | A pretend card: a real SPI slave that answers like one. |
 | `Sd` | The board wrapper — pins, LEDs, display. |
+| `spec/FakeSdCard.hs` | A pretend card: a real SPI slave that answers like one. Test code, so not in the library. |
 
-`Pmod.FakeSdCard` is why this could be written without a board in the loop, and it
-ships with the library rather than sitting in a test directory: it is what makes an
-SD design testable with an empty socket, which is a thing somebody writing their own
-controller wants and not only a thing this library's own tests want. `make
+`FakeSdCard` is why this could be written without a board in the loop. It lives in
+`spec/` rather than in `src/`, because a library has no business shipping a double
+of a part nobody's design contains — which does mean it is the library suite's
+alone, and that writing your own controller means writing your own card. `make
 test` runs the controller against it bit by bit: the full initialisation
 sequence, the ACMD41 retry loop, the start-of-block token and all 512 bytes,
 checked against what the pretend card holds. The SPI master is separately checked
@@ -505,7 +505,7 @@ decides where the next thing goes:
 
 | Namespace | Contains | Knows about |
 | --- | --- | --- |
-| `Protocol.*` | How to talk on a wire: `Protocol.SPI`, `Protocol.UART`, and `Protocol.I2C` when it is wanted | Timing and framing, not devices |
+| `Protocol.*` | How to talk on a wire: `Protocol.SPI`, `Protocol.UART`, `Protocol.I2C` | Timing and framing, not devices |
 | `Peripheral.*` | How to drive or read a class of device: `Peripheral.SevenSegment`, `Peripheral.Button` | Devices, not boards — every timing is an argument |
 | `Pmod.*` | One module per add-on you can plug into a Pmod header: `Pmod.SdCard` | Its own protocol, not which header it is on |
 | `Basys3` | This board: its clock domain, the width of each thing on its pins, and the cycle counts that make those blocks concrete | Everything, and nothing reusable |
@@ -752,6 +752,178 @@ are worth naming, because they are the reason `Serial.report` has the shape it d
 The decimal point is the one diagnostic: it lights, and stays lit, if a frame ever
 arrives with its stop bit low. That is what a terminal set to the wrong speed
 looks like from this end, and the alternative symptom is silence.
+
+## The I2C bus
+
+Nothing on this board is wired to an I2C bus, which is why none of the four designs
+uses one — `Protocol.I2C` is here for the sensors and clocks and EEPROMs that are,
+all of which arrive on two pins of a Pmod header. It is the third member of
+`Protocol.*` and the one least like the other two.
+
+### Open drain, which is most of it
+
+Two wires, SCL and SDA, with a pull-up resistor on each, and every device on the
+bus may only ever pull a line low or let go of it. Nothing drives high. That is
+what lets a target answer on the same wire the master asked on, and it is why
+`I2cOut` reports flags rather than levels:
+
+```haskell
+data I2cOut = I2cOut
+  { i2cSclLow :: Bool          -- pull SCL down; False releases it
+  , i2cSdaLow :: Bool          -- pull SDA down; False releases it
+  , i2cDone   :: Maybe I2cReply
+  , i2cIdle   :: Bool
+  }
+```
+
+`openDrain` turns either flag into the `Maybe (BitVector 1)` that
+`writeToBiSignal` wants — `Just 0` for driven, `Nothing` for released — because the
+only value an open-drain output ever drives is zero. Both lines are therefore
+`BiSignalIn` at the top level, read from and written to, which is the one part of
+using this module that is not obvious; the module header has the wiring.
+
+The same fact makes the bus trivial to model in a test. A line is high when nobody
+is holding it down, so the whole of it is one `not` of a disjunction, and adding a
+second device to a simulated bus is adding a term to that.
+
+### One operation at a time
+
+```haskell
+data I2cOp = Start | Stop | Write (BitVector 8) | Read Bool
+data I2cReply = Framed | Acked Bool | Fetched (BitVector 8)
+```
+
+`spiMaster` next door takes a byte and leaves chip select to whoever is using it,
+because chip select is a wire beside the bus and says nothing about timing. A START
+is the opposite: it *is* a particular edge in a particular place — SDA falling while
+SCL is high — so a byte pipe that could not produce one would not be speaking I2C.
+Hence the four operations. A transaction is however many of them it takes, offered
+one per `i2cIdle`:
+
+```haskell
+[Start, Write (addressFor 0x48 False), Write 0x00,
+ Start, Write (addressFor 0x48 True), Read True, Read False, Stop]
+```
+
+which is write-a-register-then-read-it, the shape almost every part wants. The
+`Start` in the middle is a repeated START, and it is the same constructor: the
+sequence it performs releases SDA, releases SCL, then pulls SDA low, which is a
+fresh START from an idle bus and a repeated one from the middle of a transaction.
+There is no way for a caller to pick the wrong one.
+
+`Read`'s argument is the acknowledge the master sends *after* the byte: `True` means
+another follows, `False` is the NACK that tells the target this was the last. Get
+that backwards and a well-behaved target keeps talking through the STOP, holding
+SDA down, and the bus wedges — which the pretend target in `spec/` models on
+purpose.
+
+### Quarters, and why a START gets halves
+
+Each bit is four quarter-periods: SDA takes the bit's value while SCL is low, SCL is
+released, the bit is sampled, SCL is pulled low again. Sampling happens halfway
+through the high period rather than at either edge of it, which matters more than it
+looks — the two input synchronisers on SDA mean a sample reads the line as it was
+two cycles ago, so a sample point at the rising edge would be reading the low
+period.
+
+A START and a STOP are built out of *half* periods instead, and the arithmetic is
+the reason. At 100 kHz the specification wants SCL high for 4.7 µs before SDA falls
+and SDA low for 4.0 µs before SCL follows: 8.7 µs of a 10 µs bit, which no
+arrangement of quarters can hold. Halves give 5 µs and 5 µs.
+
+The realised SCL is therefore a little slower than `f / (4 * (quarter + 1))`, and
+deliberately so: the high period is timed from the cycle SCL *reads* high, not from
+the cycle it was released, so the pull-up's rise time and the synchronisers are
+added to each bit rather than stolen from it. `spec/` checks that as a number — every
+high period is two quarters plus exactly two cycles.
+
+### Clock stretching
+
+A target that needs time holds SCL down after the master has released it. The clock
+is only high when the wire is high, so the master has to watch SCL as well as drive
+it, and that is the whole reason `i2cMaster` takes it as an input. Two of the ten
+phases are the ones where SCL is meant to be up and is being timed, and in both of
+them the countdown simply does not run until the line reads high.
+
+It waits indefinitely. There is no timeout, and the way out of a stuck bus is reset
+— I2C's own position being that a target holding SCL is a target that is going to
+let go. SMBus disagrees and specifies 35 ms; that would be another counter and
+another `I2cReply`.
+
+### What it does not do
+
+One master, so no arbitration and no bus-busy check — multi-master I2C means
+watching SDA for another master pulling it low under you, which is a second thing
+to do with the SDA this already reads. `addressFor` is seven-bit addressing only;
+ten-bit addressing and the general call are two `Write`s and a byte pipe does not
+need to know the difference.
+
+### How it is checked
+
+`make test` runs it, in about a second, with no HDL simulator. The interesting part
+is that the checks do not look at the master's outputs — they decode the two wires:
+
+| What | Why |
+| --- | --- |
+| `decode` | Reads a `(SCL, SDA)` trace back as a list of START, STOP and bit, one event per stretch of SCL being high. So the expected value of a check *is* the waveform, and a data bit that moved while SCL was high comes back as a stray START rather than being quietly tidied up |
+| `i2cBus` | The master, a pull-up on each line, and whatever else is pulling them down |
+| `FakeTmp2` | A pretend temperature sensor, which is the section below |
+| `stretcher` | Grabs SCL the first time it sees the line low and holds it down for a hundred cycles, which lands on the master's first data bit. The check is that the wire is *identical* to the unstretched one and the high periods are untouched — plus that one low period really did get much longer, without which a master that ignored SCL entirely would pass |
+
+## A sensor that isn't there
+
+`FakeSdCard` is what makes an SD design testable with an empty socket. `FakeTmp2`
+is the same idea on the other bus: enough of an Analog Devices ADT7420 — the part
+on a Digilent Pmod TMP2 — to be a real I2C target, watching the two wires and
+moving SDA on the edges a chip moves it on. Both sit in `spec/` beside the checks
+that use them, for the reason any fixture does: a double of a part is test code,
+and a library that ships one is shipping a fixture. Being synthesisable Clash does
+not change that. The price is that they are this suite's alone — a design's suite
+is another package and cannot import them — so a driver of your own needs a double
+of your own, and `spec/FakeTmp2.hs` is what one looks like.
+
+A sensor is a better fake than a loopback because the interesting parts of I2C are
+all about *which* device is talking:
+
+```haskell
+[ Start, Write (addressFor tmp2Address False), Write 0x00     -- point at the temperature
+, Start, Write (addressFor tmp2Address True)                  -- turn the bus around
+, Read True, Read False, Stop ]                               -- and take both halves
+```
+
+- **It answers to one address.** Ask for `0x48` instead and it says nothing at all,
+  which is indistinguishable from an empty header — the check that says its address
+  matching is real rather than a fake that acknowledges whatever it hears.
+- **It has an address pointer,** written as the first byte of a write, and it
+  survives a STOP. That is what makes "write the pointer, let go of the bus, come
+  back and read" work, and most drivers are written that way rather than with a
+  repeated START.
+- **The pointer steps on for every byte read,** so a two-byte read is the high and
+  low halves of one 16-bit register rather than the same byte twice. Reading three
+  bytes from `0x00` walks into the status register, which the tests do.
+- **It watches the master's acknowledge.** A NACK stops it talking, which matters
+  more than it sounds: a target that kept going would hold SDA down across the STOP
+  and wedge the bus it was being polite on.
+
+The temperature itself is a `Signal`, in sixteenths of a degree, which is exactly
+the part's resolution in its default 13-bit mode: the reading occupies the top
+thirteen bits of the register pair and the bottom three are alarm flags against the
+`T_HIGH`, `T_LOW` and `T_CRIT` setpoints. So `celsius 23 9` is 23.5625 °C, goes on
+the wire as `0x0B 0xC8`, and `reading 0x0B 0xC8` gives it back — and at `celsius
+(-3) (-4)` the bytes are `0xFE 0x61`, the `0x01` being the `T_LOW` flag that also
+shows up in the status register. All four of those numbers are written out in
+`spec/` rather than computed, so the encoding is stated somewhere other than in the
+code that implements it.
+
+What it is not is a part misbehaving. It converts instantly, is always ready, never
+stretches the clock — the real one does not either — and its configuration register
+is storage rather than a mode. 16-bit mode, the one-shot and SPS conversion modes,
+the `INT` and `CT` pins, the hysteresis and fault queue, and the software reset are
+all absent. The register map is a single `case`; add the one you need.
+
+There is no `Pmod.Tmp2` driver to go with it. Writing one is a nice exercise and
+the fake is what makes it a testable one — the transaction above is the whole of
+what it has to do.
 
 ## Talking to the host
 
@@ -1100,7 +1272,7 @@ package, and the GHC session inside `clash` cannot load a module out of it.
 | `src/Peripheral/SevenSegment.hs` | Digit decoder, scanning driver, word-to-digits |
 | `src/Peripheral/Button.hs` | Synchroniser, debouncer, edge pulses — for any contact |
 | `src/Pmod/SdCard.hs` | The Pmod SD: SD initialisation, a single-block read, and the six net names its constraints use |
-| `src/Pmod/FakeSdCard.hs` | A pretend card: a real SPI slave that answers like one, so an SD design is testable with an empty socket |
+| `src/Protocol/I2C.hs` | Single-master I2C: one START, STOP, byte or acknowledge at a time, and it honours a stretched clock |
 | `src/Protocol/SPI.hs` | Byte-oriented SPI mode-0 master, independent of what is on the other end |
 | `src/Protocol/UART.hs` | 8N1 transmitter and receiver, bit period as an argument |
 | `src/Serial.hs` | The host link as one thing you talk to: `serial`, and the `Source`s that feed it |
@@ -1112,7 +1284,9 @@ package, and the GHC session inside `clash` cannot load a module out of it.
 | `package.yaml`, `examples/package.yaml` | The two package descriptions, and the source of truth: Stack runs hpack on each, which generates the `.cabal` file beside it |
 | `clash-common.yaml` | The hardware stanza both packages include: extensions, the three type-level plugins, unfoldings |
 | `stack.yaml` | The snapshot — and therefore the Clash and GHC versions — and the list of packages |
-| `spec/Spec.hs` | The library's own suite: the board's cycle counts, the UART both ways, debouncing, base ten, the SD controller against the pretend card |
+| `spec/Spec.hs` | The library's own suite: the board's cycle counts, the UART both ways, debouncing, base ten, the SD controller against the pretend card, the I2C master against a decoded waveform and a pretend sensor |
+| `spec/FakeSdCard.hs` | A pretend card: a real SPI slave that answers like one, so the controller is testable with an empty socket. Test code, hence here and not in the library |
+| `spec/FakeTmp2.hs` | A pretend temperature sensor: an ADT7420 as a real I2C target, address matching and register pointer included. Test code, likewise |
 | `examples/test/Spec.hs` | The designs' suite: what each one puts on its pins and on the wire |
 | `constraints/Basys3.xdc` | The clock and the reset — the two ports every design has — and the index of the files below |
 | `constraints/Basys3-Leds.xdc` | `led[15:0]`; opt-in, like every group file |
@@ -1128,8 +1302,8 @@ package, and the GHC session inside `clash` cannot load a module out of it.
 | `syn/openxc7.Containerfile` | Native arm64 image with yosys, nextpnr-xilinx and prjxray |
 | `syn/openxc7.mk` | The bitstream flow, run inside that image |
 | `test/dump.v` | `$dumpvars` root module, compiled in so `make sim` writes a VCD |
-| `test/verilator.vlt` | One documented lint waiver, over all generated top entities, for Clash's 64-bit vector indices |
-| `test/surfer-commands.txt` | Signals Surfer preselects when opening a waveform |
+| `test/verilator.vlt` | Two documented lint waivers, over all generated top entities: Clash's 64-bit vector indices, and a `foldl`'s intermediates on one wire |
+| `test/surfer-commands.txt` | Signals Surfer preselects when opening the generated test bench's waveform |
 | `examples/bin/Clash.hs`, `examples/bin/Clashi.hs` | Entry points so `stack run clash` / `clashi` can see the designs |
 
 Three directories have tests in them, and each answers a different question:
@@ -1138,12 +1312,17 @@ Three directories have tests in them, and each answers a different question:
   still come back as the byte that went in? Is `settle` still five milliseconds of
   this board's clock? Nothing in it names a design, so it goes on passing while the
   designs are being rewritten, and the checks double as the usage examples for
-  anyone reading the library rather than these demos.
+  anyone reading the library rather than these demos. The two pretend parts,
+  `FakeSdCard` and `FakeTmp2`, are here too — a double of a chip is a fixture, and a
+  library that ships one is shipping test code.
 - `examples/test/` — the designs' suite, run by `stack test basys3-examples`. Does
-  one press of btnU move the counter by exactly one? Does the demo say `55AA` after
-  reading the card? Every check here needs a design in scope.
+  one press of btnU move the counter by exactly one? Does the board greet the host
+  and then report the counter it was told? Every check here needs a design in scope.
+  Nothing here drives `sd`: that needs the pretend card, which is in `spec/` and so
+  in another package. What `sd` puts on its LEDs and display is unchecked; the
+  controller under it is `spec/`'s business.
 - `test/` — no Haskell at all. Fixtures for Verilator and Icarus, which read Verilog:
-  the `$dumpvars` module `make sim` compiles in, the one lint waiver, and the signal
+  the `$dumpvars` module `make sim` compiles in, the lint waivers, and the signal
   list Surfer opens with.
 
 `check`, and a frame-builder and a report-speller with it, are the same few lines in

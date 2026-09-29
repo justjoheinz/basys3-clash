@@ -178,7 +178,7 @@ $(VERILOG_TOP): $(HS_SOURCES)
 sim: verilog ## RTL simulation of the generated test bench with Icarus Verilog
 	@# Only the blinky design has a TestBench annotation, so only it generates a
 	@# test bench to simulate. The SD controller is exercised in `make test`
-	@# instead, against a simulated card in Haskell (src/Pmod/FakeSdCard.hs).
+	@# instead, against a simulated card in Haskell (spec/FakeSdCard.hs).
 	@test -d $(TB_DIR) || { echo "No generated test bench for DESIGN=$(DESIGN)."; exit 1; }
 	@mkdir -p $(SIM_DIR)
 	@# test/dump.v is a second root module: Clash emits no $dumpvars, so this is

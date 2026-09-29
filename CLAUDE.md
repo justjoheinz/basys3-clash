@@ -5,10 +5,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 A Clash (Haskell → HDL) library of the Digilent Basys3's own hardware — display
-multiplexing, button debouncing, a UART, base ten and sixteen, SD over SPI, plus the
-board's pin names and clock period — with four example designs that use it. Closer
-to an Arduino library than a demo. The whole toolchain runs natively on Apple
-Silicon, place-and-route included; no vendor tools.
+multiplexing, button debouncing, a UART, base ten and sixteen, SD over SPI, an I2C
+master, plus the board's pin names and clock period — with four example designs that
+use it. Closer to an Arduino library than a demo. The whole toolchain runs natively
+on Apple Silicon, place-and-route included; no vendor tools.
 
 Board: Artix-7 `xc7a35tcpg236-1`, 100 MHz clock on W5, 16 LEDs, four-digit
 seven-segment display, FT2232HQ that is both USB-JTAG and a USB-serial bridge.
@@ -62,19 +62,27 @@ The dependency runs one way and the package graph enforces it: `import Io` insid
 `src/` is a compile error rather than something a reviewer has to catch.
 
 **Three test directories, three different questions.** `spec/` — does the library
-work with no design in scope. `examples/test/` — do the designs wire the library's
-parts up the way their haddock says. `test/` — HDL fixtures for Verilator and
-Icarus (`dump.v`, `verilator.vlt`, `surfer-commands.txt`), no Haskell. `check`,
-`frame` and `said` are deliberately duplicated between the two Haskell suites: a
-library should not export its test harness to keep its own tests tidy.
+work with no design in scope; also holds `FakeSdCard` and `FakeTmp2`, the two
+pretend parts. `examples/test/` — do the designs wire the library's parts up the way
+their haddock says. `test/` — HDL fixtures for Verilator and Icarus (`dump.v`,
+`verilator.vlt`, `surfer-commands.txt`), no Haskell. `check`, `frame` and `said` are
+deliberately duplicated between the two Haskell suites: a library should not export
+its test harness to keep its own tests tidy.
+
+**A fake belongs in a test directory, never in `src/`.** A double of a chip is a
+fixture, whatever namespace it would fit: the library does not ship one. The
+consequence is load-bearing and not a bug to fix — `spec/`'s fakes are invisible to
+`examples/test/`, which is another package, so **the `sd` design has no check on what
+it puts on its LEDs and display**. `spec/` covers the controller underneath it. A
+design's suite that wants a fake needs its own copy, the same trade `check` makes.
 
 ## Library namespaces
 
 | Namespace | Contains | Knows about |
 | --- | --- | --- |
-| `Protocol.*` | `SPI`, `UART` — how to talk on a wire | Timing and framing, not devices |
+| `Protocol.*` | `SPI`, `UART`, `I2C` — how to talk on a wire | Timing and framing, not devices |
 | `Peripheral.*` | `SevenSegment`, `Button` | Devices, not boards — **every timing is an argument** |
-| `Pmod.*` | `SdCard`, `FakeSdCard` — one module per plug-in board | Its own protocol, not which header |
+| `Pmod.*` | `SdCard` — one module per plug-in board. **No fakes here**: a double of a part is test code and lives in `spec/` | Its own protocol, not which header |
 | `Basys3` | This board: clock domain, pin widths, the cycle counts that make the above concrete | Everything, nothing reusable |
 | `Ascii`, `Serial`, `Latch` | Unprefixed on purpose: text, the host link, one register | Not a wire, a device class, or a Pmod |
 
@@ -175,9 +183,46 @@ ordinary Haskell.
   block flashing but does block `cu.*`.
 - **`make sim` and `make waves` only work for `blinky`** — it is the one design with a
   `TestBench` annotation. The SD controller is checked in `make test` instead, against
-  `Pmod.FakeSdCard`.
+  `spec/FakeSdCard.hs`.
 - `test/surfer-commands.txt` preselects signals by name (`tick`, `count`, `lit`), so
   inlining a named `where` binding in a design silently empties the waveform window.
+
+## CI
+
+`.github/workflows/` has three, and only the first runs by itself:
+
+| Workflow | When | What |
+| --- | --- | --- |
+| `ci.yml` | every push, PRs to `main` | the library's suite first, then the designs', then `make sim` and `make lint` |
+| `bitstream.yml` | **manual only** | place and route every design, `sd` on all three headers |
+| `toolchain-image.yml` | **manual only** | builds the openXC7 image, pushes it to ghcr.io |
+
+`ci.yml` is about the library: `stack build basys3` and `stack test basys3` are their
+own steps, ahead of anything with a `topEntity`, so a library failure is not buried
+under a design's. It needs no container — Stack plus apt's `iverilog` and `verilator`
+is the whole toolchain, and the container appears in only three lines of the Makefile
+(the `openxc7-image` and `$(BITSTREAM)` rules).
+
+The other two are manual because pin constraints and timing closure are properties of
+a design, not of the library. Run `bitstream.yml` by hand after touching a critical
+path: `Ascii.decDigits` is library code, nextpnr gets no `--timing-allow-fail`, and a
+depth regression is invisible to every other check here — `make test` and `make lint`
+are both perfectly happy with logic too deep to clock. It pulls the image
+`toolchain-image.yml` publishes, so **that has to have run at least once** first.
+
+CI is amd64 and a Mac is arm64; the Containerfile pins no architecture, so each side
+builds its own natively and the registry tag carries the arch (`:latest-amd64`,
+`:latest-arm64`). Both workflows derive that suffix from `uname -m`, so switching a
+job to `ubuntu-24.04-arm` needs no other edit.
+
+Both Stack caches are shared between `ci.yml` and `bitstream.yml` by key. Bump the
+`stack-work-v1-` prefix to discard the build-output cache — needed if a package is
+ever renamed, or the restored cache reproduces the `Ambiguous module name` failure
+above.
+
+Verilator comes from apt and is behind the 5.052 that `test/verilator.vlt` was
+written against. Both tool versions are echoed in the log, because a lint that fails
+only in CI is version drift before it is a defect.
 
 The README is long and is the real reference — design notes, the double-dabble
 timing table, the serial protocol, SD bring-up, and measured place-and-route figures
