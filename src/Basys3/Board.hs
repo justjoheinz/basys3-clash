@@ -21,8 +21,8 @@ That is the whole of a working design, and the reason this module exists: the
 alternative is six imports with hand-maintained name lists, which is the first
 boilerplate a beginner meets and the last one they would have thought to
 anticipate. Nothing here is new -- it is "Basys3", "Ascii", "Serial", "Latch",
-"Peripheral.Button", "Peripheral.SevenSegment" and "Clash.Prelude", re-exported
-whole.
+"Peripheral.Button", "Peripheral.SevenSegment", "Screen" and "Clash.Prelude",
+re-exported whole.
 
 What each part is for:
 
@@ -35,6 +35,11 @@ What each part is for:
     'Serial.serial' with the baud rate in it, but the 'Serial.Source' handed to
     it comes from here: 'say', 'report', 'before', and 'decoded' for the other
     direction.
+  * "Screen" is what is on the screen: 'Rgb' at any depth, the conversions that
+    land a stored pixel on the board's four bits per channel, and the patterns that
+    need no memory to draw -- 'bands', 'checker', 'border'. It re-exports
+    "Protocol.VGA", so 'Scan' and 'scanAt' arrive with it and 'Basys3.screen' is
+    the only other thing a picture needs.
   * "Latch" is one flip-flop: 'latch' remembers a one-cycle event, which is what
     makes a fault visible on a lamp.
   * "Peripheral.Button" and "Peripheral.SevenSegment" are the untimed circuits
@@ -56,6 +61,11 @@ The @Pmod@ modules are deliberately not here. A Pmod is something you bought
 separately and plugged in, so a design that uses one says so in an import, and a
 design that does not should not have "Pmod.SdCard"'s names in scope -- see the
 "Sd" design, which imports this module and that one.
+
+"Screen.Font" is left out for the same reason, though nothing was plugged in for it:
+a font is a block RAM a design chose to spend, so a design that draws text says so.
+It would also take 'Screen.Font.ink' and 'Screen.Font.within', which are better
+words than a module most designs do not use should be holding.
 -}
 module Basys3.Board
   ( module Basys3
@@ -64,6 +74,7 @@ module Basys3.Board
   , module Latch
   , module Peripheral.Button
   , module Peripheral.SevenSegment
+  , module Screen
   , module Clash.Prelude
   ) where
 
@@ -74,4 +85,5 @@ import Basys3
 import Latch
 import Peripheral.Button
 import Peripheral.SevenSegment
+import Screen
 import Serial

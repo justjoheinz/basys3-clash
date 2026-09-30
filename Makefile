@@ -125,8 +125,13 @@ WAVE_CMDS   ?= -c test/surfer-commands.txt
 VCD         := $(SIM_DIR)/testBench.vcd
 
 .DEFAULT_GOAL := help
-.PHONY: help designs describe build test repl verilog sim waves lint \
+.PHONY: help designs describe build test repl font verilog sim waves lint \
         openxc7-image bitstream flash flash-persist monitor clean distclean
+
+# Unscii 8x8, Viznut's bitmapped font, in the Public Domain. Only the unscii-16-full
+# variant is GPL, for carrying GNU Unifont glyphs; this one is not that variant.
+UNSCII_URL  ?= http://viznut.fi/unscii/unscii-8.hex
+FONT_HS     := src/Screen/Font/Unscii8.hs
 
 help: ## Show this help
 	@# MAKEFILE_LIST includes the design file this run included, which would put
@@ -162,6 +167,14 @@ test: ## Haskell-level simulation -- fast, needs no HDL simulator
 
 repl: ## Interactive Clash REPL (try: sampleN @System 20 (withClockResetEnable clockGen resetGen enableGen (blinky 2)))
 	$(STACK) --silent run clashi -- examples/src/$(TOP_MODULE).hs
+
+font: ## Regenerate the font ROM from upstream unscii-8.hex (needs the network)
+	@# $(FONT_HS) is generated and checked in, so this is a one-off: the bytes are in
+	@# the repository and a build never reaches for the network. Run it to move to a
+	@# new unscii release, and read the diff -- tools/unscii.py says why it is a
+	@# generated Haskell module rather than a .hex read at compile time.
+	curl -sSfL --max-time 60 '$(UNSCII_URL)' | tools/unscii.py - > $(FONT_HS)
+	@echo "$(FONT_HS) regenerated from $(UNSCII_URL)"
 
 verilog: $(VERILOG_TOP) ## Generate Verilog into verilog/
 

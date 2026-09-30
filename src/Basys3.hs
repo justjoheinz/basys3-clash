@@ -32,6 +32,9 @@ What is underneath:
     which 'onBoard' does so that no design has to.
   * "Serial" and "Protocol.UART" talk to the host over the board's USB-serial
     bridge, at 'baud115200' cycles per bit: 'host'.
+  * "Screen" and "Protocol.VGA" drive the VGA connector, one pixel every 'dot' + 1
+    cycles: 'screen' is 640x480 at 60 Hz with that rate already in it, 'Vga' its
+    14 pins and 'Colour' what they can show.
 
 The board also has 16 LEDs, which need no logic at all: 'Leds' is just wires.
 
@@ -67,6 +70,8 @@ module Basys3
   , Display (..)
   , Leds
   , Switches
+  , Vga (..)
+  , Colour
     -- * Reading its contacts
   , Settle
   , settle
@@ -78,6 +83,11 @@ module Basys3
   , showDigits
   , showHex
   , withPoint
+    -- * Driving its screen
+  , dot
+  , pixel
+  , vgaPins
+  , screen
     -- * Talking to the host
   , baud115200
   , host
@@ -96,12 +106,14 @@ module Basys3
   , btnRPort
   , uartRxPort
   , uartTxPort
+  , vgaPort
   ) where
 
 import Clash.Prelude
 
 import Peripheral.Button       (bank, contact)
 import Peripheral.SevenSegment (display, hexDigits)
+import Screen                  (Rgb (..), Scan (..), black, scan, vga640x480at60)
 import Serial                  (Source, UartRx, serial)
 
 -- | The Basys3 has a single-ended 100 MHz oscillator on pin W5. We use the
@@ -179,6 +191,36 @@ type Leds = BitVector 16
 -- switch is up. Pass them through 'switches' before using them: this is the pin
 -- as it comes off the pad, and a slide switch bounces like any other contact.
 type Switches = BitVector 16
+
+-- | The 14 pins of the VGA connector, as one value, for the reason 'Display' is a
+-- record: a tuple of three colour channels and two syncs is documented only by its
+-- order, and getting red and blue the wrong way round is a bitstream and a puzzled
+-- look at a monitor rather than a type error.
+--
+-- Built by 'vgaPins' and driven by 'screen'; a design should not need to name the
+-- fields.
+data Vga = Vga
+  { redPin   :: BitVector 4
+    -- ^ Pins G19, H19, J19, N19, bit 0 least significant.
+  , greenPin :: BitVector 4
+    -- ^ Pins J17, H17, G17, D17.
+  , bluePin  :: BitVector 4
+    -- ^ Pins N18, L18, K18, J18.
+  , hsyncPin :: Bit
+    -- ^ Pin P19. Active low at 640x480, which is a property of the mode and not
+    -- of the board -- 'Protocol.VGA.Polarity' is where that is said.
+  , vsyncPin :: Bit
+    -- ^ Pin R19.
+  }
+  deriving (Generic, NFDataX, BitPack, ShowX, Show, Eq)
+
+-- | What this board's connector can show: four bits per channel, so 4096 colours.
+--
+-- Each channel is a resistor DAC into the monitor's 75 ohm termination, sized for
+-- it, so a channel driven high is a voltage rather than a short -- but it is also
+-- not a digital output whose level means anything on its own. "Screen" is where a
+-- colour comes from, at whatever depth the pixel was stored at.
+type Colour = Rgb 4
 
 -- | Cycles a contact must read steady before the board believes it: 5 ms at
 -- 100 MHz. Tactile switches and slide switches of this kind bounce for a few
@@ -296,6 +338,106 @@ withPoint
 withPoint lit = liftA2 set lit
  where
   set on d = d { decimalPoint = boolToBit (not on) }
+
+-- | Clock cycles per pixel, minus one, for 640x480 at 60 Hz: three, so the beam
+-- advances at 100e6 \/ 4 = 25.000 MHz.
+--
+-- The mode asks for 25.175 MHz. 100 MHz does not divide to it, so the raster runs
+-- 0.7% slow and the frame rate comes out at 59.52 Hz instead of 59.94 -- outside
+-- VESA's tolerance on paper, and accepted by every monitor anyone has tried it on,
+-- because what a monitor actually locks onto is the two sync pulses and it measures
+-- their period for itself. 'Protocol.VGA.refresh' is that arithmetic if you want to
+-- see it.
+--
+-- Exported bare for the reason 'settle', 'dwell' and 'baud115200' are, and for one
+-- specific to it: closing the gap means an MMCM, and if this flow ever grows one
+-- then the number that changes is this one.
+dot :: Unsigned 32
+dot = 3
+
+-- | The pixel rate as a clock /enable/: 'prescaler' at 'dot', so one cycle in four.
+--
+-- __Not a second clock domain, on purpose.__ A 25 MHz domain beside the board's 100
+-- MHz one would need an MMCM to generate it, a second @create_clock@, and a
+-- @set_clock_groups@ to stop the router timing paths between the two -- and
+-- nextpnr-xilinx silently ignores the constraints it does not implement, so that
+-- last one would sit in the file looking present and do nothing. An enable has none
+-- of those parts: every register in the design stays in 'Basys3', every path is
+-- checked against 10 ns, and there is no crossing to get wrong.
+--
+-- The cost is that three cycles in four do nothing, which on a design whose entire
+-- pixel path is a few comparisons is not a cost.
+pixel :: HiddenClockResetEnable Basys3 => Signal Basys3 Bool
+pixel = prescaler dot
+
+-- | One pixel period's worth of beam and colour, as the 14 pins.
+--
+-- Pure, like 'Pmod.SdCard.sdPins', and it is the one place blanking is enforced:
+-- the colour is forced to 'Screen.black' whenever 'scanAt' is 'Nothing', whatever
+-- the pixel function said. A monitor measures its own black level during the
+-- porches, so a picture painted through one comes out washed out across the whole
+-- screen -- and that is a bug that looks like a bad cable. Enforcing it here means
+-- a design cannot have it, rather than having to remember not to.
+vgaPins :: Scan -> Colour -> Vga
+vgaPins beam colour = Vga
+  { redPin   = rgbRed   shown
+  , greenPin = rgbGreen shown
+  , bluePin  = rgbBlue  shown
+  , hsyncPin = scanHsync beam
+  , vsyncPin = scanVsync beam
+  }
+ where
+  shown
+    | Just _ <- scanAt beam = colour
+    | otherwise             = black
+
+-- | The whole screen: 640x480 at 60 Hz on this board's connector, given something
+-- that says what colour each pixel is.
+--
+-- @
+-- outline :: 'Signal' 'Basys3' 'Scan' -> 'Signal' 'Basys3' 'Colour'
+-- outline = 'fmap' at
+--  where
+--   at beam = case 'scanAt' beam of
+--     Just p  -> 'Screen.mono' ('Screen.border' 4 (640, 480) p)
+--     Nothing -> 'Screen.black'
+--
+-- topEntity :: 'Clock' 'Basys3' -> 'Reset' 'Basys3' -> 'Signal' 'Basys3' 'Vga'
+-- topEntity clk rst = 'onBoard' clk rst ('screen' outline)
+-- {-\# ANN topEntity ('basys3' "outline" [] 'vgaPort') \#-}
+-- @
+--
+-- The 'Nothing' branch is written because the @case@ has to be total, not because
+-- anything depends on it: 'vgaPins' blanks the porches whatever it said.
+--
+-- The pixel function is an argument rather than this returning a 'Scan' for a
+-- design to finish, which is what keeps the colour and the syncs aligned: there is
+-- one 'register' across the whole record, so all 14 pins leave on the same edge and
+-- the colour cannot arrive a cycle after the sync that framed it. Handing back a
+-- scan would put that register in the design, four times over, and nothing would
+-- say so.
+--
+-- It is also why the argument takes and returns a 'Signal': a pixel function is
+-- welcome to have state -- a framebuffer read is exactly that -- provided it adds
+-- no latency of its own relative to the beam.
+screen
+  :: HiddenClockResetEnable Basys3
+  => (Signal Basys3 Scan -> Signal Basys3 Colour)
+  -- ^ What colour the beam is on. Only consulted where 'scanAt' is 'Just'.
+  -> Signal Basys3 Vga
+screen paint = register dark (vgaPins <$> beam <*> paint beam)
+ where
+  beam = scan vga640x480at60 pixel
+
+  -- Blank, with both syncs where 640x480 idles them, which is high: they are
+  -- active low. Built through 'vgaPins' rather than written out, so it cannot
+  -- disagree with what the first real pixel period produces -- and it matches
+  -- 'scan''s own reset state, which is the top left corner.
+  dark = vgaPins Scan { scanHsync = high
+                      , scanVsync = high
+                      , scanAt    = Nothing
+                      , scanFrame = False
+                      } black
 
 -- | Clock cycles per UART bit, minus one, for 115200 baud: 100e6 \/ 115200 is
 -- 868.06, so each bit is 868 cycles and the divisor "Protocol.UART" wants is 867.
@@ -425,3 +567,20 @@ uartRxPort = PortName "uart_rx"
 -- | The line to the host, pin A18.
 uartTxPort :: PortName
 uartTxPort = PortName "uart_tx"
+
+-- | The VGA connector's five ports, in the order 'Vga' names them: the three
+-- four-bit colour channels and the two syncs. Flat, as @vga_red@, @vga_green@,
+-- @vga_blue@, @vga_hsync@, @vga_vsync@, which is what @constraints\/Basys3-Vga.xdc@
+-- expects.
+--
+-- Unverified, unlike every other name here: no design in this repo drives these
+-- ports, so nothing has ever made Clash emit them and nothing has matched them
+-- against the constraints file. A port with no constraint fails late, in nextpnr's
+-- FASM step; the first design to call 'screen' is what finds out.
+vgaPort :: PortName
+vgaPort = ports [ PortName "vga_red"
+                , PortName "vga_green"
+                , PortName "vga_blue"
+                , PortName "vga_hsync"
+                , PortName "vga_vsync"
+                ]

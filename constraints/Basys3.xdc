@@ -39,9 +39,13 @@
 ##
 ## Three of those files are pins no design here drives yet: the VGA connector, the
 ## PS/2 port and the configuration flash. Nothing has been through place-and-route
-## with them, so the port names in them are a proposal that the first design to
-## want them settles -- unlike every other file here, which is exercised by
-## `make bitstream`.
+## with them, so unlike every other file here they are not exercised by
+## `make bitstream`, and their port names have never been matched against a
+## netlist. For the VGA connector the Haskell side is no longer missing --
+## Basys3.vgaPort settles those five names and spec/Spec.hs checks the record they
+## come from -- so what is unverified there is the two lists against each other.
+## For PS/2 and the flash the names are still a proposal that the first design to
+## want them settles.
 
 ## 100 MHz system clock. Only the pin is assigned here: the period comes from
 ## the Basys3 domain's vPeriod in src/Basys3.hs, which Clash emits beside each

@@ -3,14 +3,14 @@
 A library of the Basys3's own hardware, written in Haskell with
 [Clash](https://clash-lang.org) and built on Apple Silicon: the display's
 multiplexing, the buttons' debouncing, a UART at the baud rate the board's bridge
-wants, base ten and base sixteen, an SD card over SPI, and the pin names and clock
-period that the toolchain needs and that nobody should be retyping. Closer to an
-Arduino library than to a demo: the parts are meant to be picked up and used, and
-the four designs here are what using them looks like.
+wants, base ten and base sixteen, an SD card over SPI, VGA at 640x480 with a font
+in it, and the pin names and clock period that the toolchain needs and that nobody
+should be retyping. Closer to an Arduino library than to a demo: the parts are meant
+to be picked up and used, and the four designs here are what using them looks like.
 
 The board is a Digilent Basys3: AMD Artix-7 `xc7a35tcpg236-1`, 100 MHz clock on
-pin W5, 16 LEDs, a four-digit seven-segment display, and an FT2232HQ that is both
-the USB-JTAG programmer and a USB-serial bridge.
+pin W5, 16 LEDs, a four-digit seven-segment display, a VGA connector, and an
+FT2232HQ that is both the USB-JTAG programmer and a USB-serial bridge.
 
 A design that lights the switches, shows them in hex on the display and prints them
 in decimal to your terminal is one import and four lines of circuit:
@@ -498,17 +498,18 @@ recorded but not acted on; reading any other block would have to branch on it.
 ## The board's own hardware
 
 The Basys3 carries 16 LEDs, 16 slide switches, five push buttons, a four-digit
-seven-segment display, and a serial link to the host that needs no extra hardware
-at all. Four namespaces divide the code that drives all of that and
+seven-segment display, a VGA connector, and a serial link to the host that needs no
+extra hardware at all. Five namespaces divide the code that drives all of that and
 the modules plugged into it, and the rule for each is worth stating because it
 decides where the next thing goes:
 
 | Namespace | Contains | Knows about |
 | --- | --- | --- |
-| `Protocol.*` | How to talk on a wire: `Protocol.SPI`, `Protocol.UART`, `Protocol.I2C` | Timing and framing, not devices |
+| `Protocol.*` | How to talk on a wire: `Protocol.SPI`, `Protocol.UART`, `Protocol.I2C`, `Protocol.VGA` | Timing and framing, not devices |
 | `Peripheral.*` | How to drive or read a class of device: `Peripheral.SevenSegment`, `Peripheral.Button` | Devices, not boards — every timing is an argument |
 | `Pmod.*` | One module per add-on you can plug into a Pmod header: `Pmod.SdCard` | Its own protocol, not which header it is on |
 | `Basys3` | This board: its clock domain, the width of each thing on its pins, and the cycle counts that make those blocks concrete | Everything, and nothing reusable |
+| unprefixed | What is none of the above: `Ascii` is text, `Serial` the host link, `Screen` what is on the screen, `Latch` one flip-flop | Not a wire, not a class of device, not a Pmod |
 
 That is the same split `Blinky` already makes between its parameterised circuit
 and its `topEntity`, applied one level up: a test can instantiate `debounce 3`
@@ -533,7 +534,7 @@ worth testing.
 
 ### One import
 
-`Basys3.Board` is `Basys3`, `Ascii`, `Serial`, `Peripheral.Button`,
+`Basys3.Board` is `Basys3`, `Ascii`, `Serial`, `Screen`, `Peripheral.Button`,
 `Peripheral.SevenSegment`, `Latch` and `Clash.Prelude` together, and it is what a
 design should import. Every demo here uses it; neither test suite does, because a
 test that pins a byte should also pin which module spelt it — and a name moving
@@ -549,13 +550,20 @@ The `Pmod.*` modules are deliberately left out. A Pmod is something bought
 separately and plugged in, so the design using one says which: `Sd` imports
 `Basys3.Board` and `Pmod.SdCard`.
 
-Two modules sit outside all four on purpose, unprefixed. `Ascii` is about text, not
-about a wire, a class of device, or something you can plug into a header. `Serial`
-is the convenience layer over `Protocol.UART` and `Ascii`: the front door to the
-host link, which is a thing a design uses rather than a thing a wire has. Pushing
-it into `Protocol.*` would make a framing module depend on text, and forcing either
-into one of the four would only make the table mean less. See
-[Writing to the host](#writing-to-the-host).
+`Screen.Font` is left out for the same reason, though nothing is plugged in for it:
+a font is a block RAM a design decided to spend, so the design that draws text says
+so. See [Driving a screen](#driving-a-screen).
+
+Three modules sit outside the prefixed namespaces on purpose. `Ascii` is about text,
+not about a wire, a class of device, or something you can plug into a header.
+`Serial` is the convenience layer over `Protocol.UART` and `Ascii`: the front door
+to the host link, which is a thing a design uses rather than a thing a wire has.
+`Screen` is the same shape one namespace over — the convenience layer over
+`Protocol.VGA`, and what a pixel is *worth* rather than when it happens. Pushing
+`Serial` into `Protocol.*` would make a framing module depend on text, and forcing
+any of them into one of the four would only make the table mean less. See
+[Writing to the host](#writing-to-the-host) and
+[Driving a screen](#driving-a-screen).
 
 **LEDs** need no logic — `Basys3.Leds` is a `BitVector 16` and the register drives
 the pin. **The display** is `Peripheral.SevenSegment`: `sevenSeg` decodes a nibble
@@ -752,6 +760,167 @@ are worth naming, because they are the reason `Serial.report` has the shape it d
 The decimal point is the one diagnostic: it lights, and stays lit, if a frame ever
 arrives with its stop bit low. That is what a terminal set to the wrong speed
 looks like from this end, and the alternative symptom is silence.
+
+### Driving a screen
+
+**Nothing here has been on a monitor.** That is the first thing to say, because
+everything below it is tested and none of it is *verified*: no design has VGA ports,
+so `make verilog`, `make lint` and `make bitstream` cannot reach any of it, and the
+five `PortName` strings in `Basys3.vgaPort` have never been matched against the
+fourteen pin constraints in `constraints/Basys3-Vga.xdc`. What is checked is the
+Haskell — 27 checks in `spec/Spec.hs`, including a whole frame of a miniature mode
+sampled pixel by pixel. The first design to call `screen` is what closes the gap,
+and it will find out about a wrong port name late, in nextpnr's FASM step, as
+`port X of type PAD has no IOSTANDARD property`.
+
+The connector is a 4-bit resistor DAC per channel — 16 levels each, 4096 colours —
+plus the two syncs, and each line is terminated into 75 Ω at the monitor. So a
+channel is not a digital output whose level means anything on its own, which is why
+`Screen`'s widenings repeat a value's own top bits downward rather than
+zero-padding: `0b111` becomes `0b1111`, so full scale stays full scale and white
+does not come out 7/8 grey.
+
+#### One mode, and why only one
+
+640x480 at 60 Hz, `Protocol.VGA.vga640x480at60`:
+
+| | Visible | Front porch | Sync pulse | Back porch | Total |
+| --- | --- | --- | --- | --- | --- |
+| Horizontal | 640 | 16 | 96 | 48 | 800 |
+| Vertical | 480 | 10 | 2 | 33 | 525 |
+
+Both syncs active low, which is a property of the mode rather than of the board.
+800 x 525 is 420,000 pixel periods a frame.
+
+The mode wants a 25.175 MHz pixel clock. **This board makes 25.000 MHz instead — a
+1-in-4 enable on the 100 MHz clock — and that is 0.7% slow: 59.52 Hz rather than
+59.94.** Outside VESA's tolerance on paper, accepted by every monitor anyone has
+tried it on, and the alternative is an MMCM. Every higher mode needs one
+unavoidably, because none of their pixel clocks is an integer divisor of 100 MHz
+(800x600 wants 40 MHz, 1024x768 65, 1280x1024 108), and
+[Getting a bitstream](#getting-a-bitstream) says why MMCMs are not worth relying on
+in this flow yet. Clash's own
+`Clash.Xilinx.ClockGen.clockWizard` cannot help: it emits a Vivado `clk_wiz` IP
+instantiation, which yosys has nothing to do with. So shipping the higher modes
+would be shipping a trap, and the record shape means adding one later is four
+numbers and a polarity rather than a redesign.
+
+**The pixel rate is an enable, not a clock.** `Basys3.dot` is 3 and
+`Basys3.pixel` is `prescaler dot`, in the ordinary `Basys3` domain — so there is no
+second clock domain, no clock-domain crossing, no `create_clock` and no
+`set_clock_groups`. That last one is the real reason. A second domain at a quarter
+the frequency is trivially safe in principle and would be declared with exactly the
+kind of constraint nextpnr-xilinx accepts and silently ignores, so the safety would
+be unchecked. An enable needs no constraint to be correct, and the existing 10 ns
+period covers all fourteen output registers.
+
+#### Three layers, the same shape as the serial stack
+
+`Protocol.UART` → `Serial` → `Basys3.host` becomes `Protocol.VGA` → `Screen` →
+`Basys3.screen`, for the same reasons and with the same visibility: `Protocol.VGA`
+is not in `Basys3.Board`, and designs reach it through `Screen`'s re-export.
+
+- **`Protocol.VGA`** is *when* each pixel happens: `Timing` per axis
+  (visible/front/pulse/back/polarity), `Mode` as two of those, and `scan`, a
+  `moore` machine over an `(x, y)` pair that steps on the enable. Moore for the
+  reason `uartTx` is: the pin follows a register, so nothing upstream can glitch a
+  sync mid-pulse. Timings are *values*, so a test can pass tiny ones — which is the
+  whole reason the behaviour is testable at all, since a real frame is 1.68 million
+  clock cycles and nobody simulates that. The spec's mode is 8 x 6, so one frame is
+  48 pixel periods and every sample of it can be checked by hand.
+- **`Screen`** is what each pixel is *worth*: `Rgb n` at any depth, the four depths
+  a pixel is plausibly stored at (1 bpp, 4 bpp grey, 8 bpp as 3:3:2, 12 bpp direct),
+  eight named colours, and the patterns that need no memory — `bands`, `checker`,
+  `border`. All shifts and comparisons, no divider: a pixel is 40 ns against the
+  10 ns everything else here is measured against, and there is no reason to spend
+  any of it. That is `Ascii.steps`'s lesson — the one that cost 25 ns and a failed
+  timing report — applied before measuring rather than after.
+- **`Basys3`** applies the board: `Vga` as the fourteen pins, `Colour` as `Rgb 4`,
+  `dot`, `pixel`, `vgaPins` and `screen`.
+
+**Blanking is enforced twice, in two different ways.** `Scan.scanAt` is a
+`Maybe (Coord, Coord)` — `Nothing` while the beam is in a porch — which makes "do
+not paint outside the visible area" a thing the type says rather than a convention;
+and `vgaPins` forces black whenever it is `Nothing`, so no design can get it wrong
+even by trying. A monitor that sees a non-black blanking interval mis-measures its
+black level, so this is correctness and not tidiness. The spec paints white
+everywhere and checks the porches come out black anyway.
+
+`screen` takes the pixel function as an argument rather than handing back a scan,
+and that is what keeps the pins aligned: one `register` across the whole `Vga`
+record, so all fourteen are registered together. Its reset value is built by calling
+`vgaPins` rather than written out, so it cannot disagree with the first real pixel
+period, and both syncs idle high because both are active low.
+
+#### Four cycles of free latency
+
+Worth stating separately, because it is what makes a memory-backed pixel function
+drop into `screen` unchanged. A constant delay on the colour path *relative to the
+syncs* is a constant horizontal shift — and a pixel is four clock cycles, so one
+cycle of delay is a quarter of a pixel and two is half. Anything under four cycles
+is sub-pixel and invisible. A synchronous ROM costs one; a character map in a second
+block RAM costs another; that is still only half a pixel. At four cycles it becomes a
+whole pixel and the address has to start leading the beam instead.
+
+#### A font in a block RAM
+
+`Screen.Font` is [unscii 8x8](http://viznut.fi/unscii/), Viznut's bitmapped Unicode
+font, in the Public Domain — only its `unscii-16-full` variant is GPL, for carrying
+GNU Unifont glyphs, and this is not that variant. `src/Screen/Font/Unscii8.hs` is the
+2 KB of it this board uses: 256 glyphs of eight rows, U+0000 to U+00FF, so the ROM is
+indexed by a byte. `make font` regenerates it from upstream through
+`tools/unscii.py`, and reproduces the checked-in file byte for byte.
+
+It is generated and checked in rather than read at compile time on purpose. Only
+2 KB of upstream's 60 KB is used, a Template Haskell file read depends on the
+compiler's working directory, and a literal needs no build-time dependency at all —
+so a build never reaches for the network and the bytes are in the repository where a
+diff can be read.
+
+**8x8 rather than the 8x16 a PC used**, and the first reason shows up in a timing
+report. With eight rows to a glyph, the ROM address for row *r* of glyph *c* is
+`c * 8 + r`, and because eight is a power of two that multiply is a shift is a bit
+concatenation: `glyphAddr` is `c ++# r` and costs no logic whatsoever. A 14-row cell,
+as EGA used, puts a real multiplier in the pixel path. The second reason is that 8x8
+is the tile arcade boards and the NES used, so it is where the look comes from; 8x16
+reads as a DOS terminal.
+
+The one number that is not a power of two is the character map's stride. A map is
+indexed by `cellY * columns + cellX`, and at 640 pixels wide `columns` is 80 — so
+that one *is* a multiply. 80 is 64 + 16, two shifts and an adder, which is cheap; or
+pad the stride to 128 and the address goes back to being `cellY ++# cellX` at the
+price of a third of the map. Which is right depends on how many block RAMs are left,
+so `Screen.Font` does not choose: `cellAt` hands over the two cell coordinates and
+the design addresses its own memory.
+
+Cost: 16 Kb of font is one RAMB18E1, and an 80x60 map of bytes is another 38 Kb, so a
+whole text mode is two of this part's fifty 36-Kb blocks and a few comparators —
+around 4%, and the cheapest way there is to put something legible on a screen.
+
+#### What a framebuffer would cost
+
+Deferred, and worth writing down while the arithmetic is fresh. The `xc7a35t` has
+1,800 Kb of block RAM (fifty 36-Kb blocks) and the board has **no external RAM at
+all** — 4 MB of QSPI flash and nothing else. 640x480 is 307,200 pixels, so:
+
+| Depth | Bits | Of the part's block RAM |
+| --- | --- | --- |
+| 1 bpp | 300 Kb | 17% |
+| 4 bpp | 1,200 Kb | 67% |
+| 8 bpp | 2,400 Kb | 133% — does not fit |
+| 320x240 at 12 bpp, pixel-doubled | 900 Kb | 50% |
+
+**One trap, if you check this against a report.**
+`build/openxc7/sketch/sketch.report.json` says `RAMB36E1: 0/75` and
+`RAMB18E1: 0/150`. Those are the `xc7a50t` die's counts: nextpnr-xilinx's prjxray
+database does not mask the blocks fused off on the 35T. Budget against fifty, not
+seventy-five — which is Xilinx DS180's number for this part, and the one the silicon
+has.
+
+Two things about block RAM in this flow are also still untested, since nothing here
+has used any: whether yosys infers and nextpnr routes it, and whether nextpnr writes
+`INIT_xx` initial contents into the FASM. The font ROM is the ideal first test of the
+second, because a dropped initialiser is not a subtle bug — it is a blank screen.
 
 ## The I2C bus
 
@@ -1267,7 +1436,7 @@ package, and the GHC session inside `clash` cannot load a module out of it.
 | --- | --- |
 | `src/Ascii.hs` | Text as bytes, all of it pure: a string literal as a `Vec`, hex and decimal digits, a line ending |
 | `src/Basys3.hs` | This board: clock domain, `onBoard`, prescaler, pin types and names, its timings, and the circuits with those timings applied |
-| `src/Basys3/Board.hs` | That plus `Ascii`, `Serial`, both peripherals and `Clash.Prelude`, re-exported — the one import a design needs |
+| `src/Basys3/Board.hs` | That plus `Ascii`, `Serial`, `Screen`, both peripherals and `Clash.Prelude`, re-exported — the one import a design needs |
 | `src/Latch.hs` | One flip-flop: `latch`, which remembers a one-cycle event for as long as anyone needs to see it |
 | `src/Peripheral/SevenSegment.hs` | Digit decoder, scanning driver, word-to-digits |
 | `src/Peripheral/Button.hs` | Synchroniser, debouncer, edge pulses — for any contact |
@@ -1275,6 +1444,10 @@ package, and the GHC session inside `clash` cannot load a module out of it.
 | `src/Protocol/I2C.hs` | Single-master I2C: one START, STOP, byte or acknowledge at a time, and it honours a stretched clock |
 | `src/Protocol/SPI.hs` | Byte-oriented SPI mode-0 master, independent of what is on the other end |
 | `src/Protocol/UART.hs` | 8N1 transmitter and receiver, bit period as an argument |
+| `src/Protocol/VGA.hs` | Sync framing and where the beam is, timings as arguments — `640x480` is one value among them |
+| `src/Screen.hs` | What is on the screen: `Rgb` at any depth, the four depths a pixel is stored at, and the patterns that need no memory |
+| `src/Screen/Font.hs` | unscii 8x8 in a block RAM, and the concatenation that turns a character code and a beam position into one pixel |
+| `src/Screen/Font/Unscii8.hs` | 2 KB of font, generated and checked in; `make font` regenerates it |
 | `src/Serial.hs` | The host link as one thing you talk to: `serial`, and the `Source`s that feed it |
 | `examples/src/Blinky.hs` | The blinker: the LED pattern, `topEntity`, `testBench` |
 | `examples/src/Io.hs` | The switch-and-button demo: switches on the LEDs, buttons on a counter, that counter on the serial link |
@@ -1294,7 +1467,7 @@ package, and the GHC session inside `clash` cannot load a module out of it.
 | `constraints/Basys3-Switches.xdc` | `sw[15:0]`, and their timing exception |
 | `constraints/Basys3-Buttons.xdc` | `btnU`, `btnD`, `btnL`, `btnR`; btnC is the reset |
 | `constraints/Basys3-Uart.xdc` | The two USB-UART pins |
-| `constraints/Basys3-Vga.xdc` | The VGA connector; reference only, no design drives it |
+| `constraints/Basys3-Vga.xdc` | The VGA connector; the library drives it, no design here does yet |
 | `constraints/Basys3-Ps2.xdc` | The USB HID port's PS/2 pair; reference only |
 | `constraints/Basys3-Flash.xdc` | The configuration flash; reference only, and read its header first |
 | `constraints/PmodSD.xdc` | The Pmod SD's timing exceptions and pinout notes, whichever header it is on |
@@ -1304,6 +1477,7 @@ package, and the GHC session inside `clash` cannot load a module out of it.
 | `test/dump.v` | `$dumpvars` root module, compiled in so `make sim` writes a VCD |
 | `test/verilator.vlt` | Two documented lint waivers, over all generated top entities: Clash's 64-bit vector indices, and a `foldl`'s intermediates on one wire |
 | `test/surfer-commands.txt` | Signals Surfer preselects when opening the generated test bench's waveform |
+| `tools/unscii.py` | Upstream `unscii-8.hex` to the Haskell module above, and the header says why that is generated rather than read at compile time |
 | `examples/bin/Clash.hs`, `examples/bin/Clashi.hs` | Entry points so `stack run clash` / `clashi` can see the designs |
 
 Three directories have tests in them, and each answers a different question:
@@ -1387,10 +1561,16 @@ Pin assignments were taken from Digilent's
 against it. What no design here drives yet is the VGA connector, the USB-HID port's
 PS/2 pair, and the configuration flash; each has a file of its own —
 `constraints/Basys3-Vga.xdc`, `-Ps2.xdc`, `-Flash.xdc` — with the pins already
-cross-checked, so the work left is the Haskell side. Those three have never been
-through place-and-route, since no top entity has the ports, so the port names in
-them are a proposal for the first design that wants them to settle, together with
-the matching `PortName` values in `src/Basys3.hs`. Each file's header says what
-else that hardware needs: a pixel clock domain for VGA, bidirectional pins for
-talking back to a keyboard, and for the flash the fact that its clock is not a
-user I/O at all and that these are the nets the FPGA configures itself from.
+cross-checked. None of the three has been through place-and-route, since no top
+entity has the ports.
+
+The VGA connector is now half done: the Haskell exists and is tested — see
+[Driving a screen](#driving-a-screen) — and `Basys3.vgaPort` settles those five
+port names, so what is left there is one design with the ports on it, which is
+also the only thing that can check those names against the fourteen constraints.
+For PS/2 and the flash the Haskell side is the work, and the port names in those
+two files remain a proposal for the first design that wants them to settle,
+together with the matching `PortName` values in `src/Basys3.hs`. Each header says
+what else that hardware needs: bidirectional pins for talking back to a keyboard,
+and for the flash the fact that its clock is not a user I/O at all and that these
+are the nets the FPGA configures itself from.

@@ -1,22 +1,31 @@
 ## The Basys3's VGA connector: four bits per colour channel, plus the two syncs.
 ##
-## Nothing in this repository drives these pins. The file is here as verified
-## reference material -- the pins are cross-checked against Digilent's
-## Basys-3-Master.xdc -- but unlike every other file in constraints/ it has never
-## been through place-and-route, because no top entity has these ports for nextpnr
-## to match. Two consequences worth knowing before using it:
+## The library drives these pins -- Basys3.screen and Basys3.vgaPins, over
+## Protocol.VGA and Screen -- but no design here does yet, so unlike every other
+## file in constraints/ this one has never been through place-and-route: no top
+## entity has these ports for nextpnr to match. The pins themselves are
+## cross-checked against Digilent's Basys-3-Master.xdc. Two things worth knowing
+## before using it:
 ##
 ##   * The port names below are this repository's convention (lower case, one word
 ##     per pin group) rather than Digilent's, whose master file calls them vgaRed,
-##     vgaGreen, vgaBlue, Hsync and Vsync. Nothing has settled them; the first
-##     design to want VGA settles them, together with the matching PortName values
-##     in src/Basys3.hs.
-##   * There are no timing exceptions here, and that is not an omission: what they
-##     should be depends on how the design drives the connector. VGA wants a pixel
-##     clock -- 25.175 MHz for 640x480 at 60 Hz, which the Basys3's 100 MHz divides
-##     to 25 MHz, close enough for every monitor in practice -- so these are
-##     registered outputs of whatever domain that clock belongs to, and the
-##     constraint that matters is the one relating that domain to this one.
+##     vgaGreen, vgaBlue, Hsync and Vsync. They are settled: Basys3.vgaPort is the
+##     matching PortName list, in this file's order, and spec/Spec.hs pins the
+##     field order and the 14-bit width of the Vga record it comes from. What is
+##     still unverified is these fourteen names against those five -- a mismatch
+##     shows up only in nextpnr's FASM step, as "port X of type PAD has no
+##     IOSTANDARD property", and the first design to have VGA ports is what
+##     provokes it.
+##   * There are no timing exceptions here, and that is now an answer rather than
+##     a deferral. VGA wants a pixel clock -- 25.175 MHz for 640x480 at 60 Hz --
+##     and the library does not make one: Basys3.pixel is a 1-in-4 enable in the
+##     ordinary 100 MHz Basys3 domain, so 25.000 MHz is a quarter of the clock
+##     that is already constrained and there is no second domain to relate this
+##     one to. That is deliberate. A create_clock plus a set_clock_groups is
+##     exactly the shape of constraint nextpnr-xilinx accepts and silently ignores
+##     (see the README), so a real pixel-clock domain here would look safe and be
+##     unchecked. These are registered outputs of the 100 MHz domain, all fourteen
+##     of them from one register, and the existing clock constraint covers them.
 ##
 ## Electrically each channel is a 4-bit resistor DAC: 16 levels per colour, 4096
 ## colours. The monitor terminates each line into 75 ohm, which the resistor

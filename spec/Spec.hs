@@ -19,14 +19,14 @@ module Main (main) where
 import           Clash.Prelude
 import           Control.Monad           (unless)
 import           Data.List               (group, groupBy, nub)
-import           Data.Maybe              (mapMaybe)
+import           Data.Maybe              (isJust, mapMaybe)
 import qualified Prelude                 as P
 import           System.Exit             (exitFailure)
 
 import           Ascii                   (ascii, dec, decDigits, hex, hexChar,
                                           hexNibble, line)
-import           Basys3                  (baud115200, dwell, prescaler, settle,
-                                          vBasys3)
+import           Basys3                  (Colour, Vga (..), baud115200, dot, dwell,
+                                          prescaler, settle, vBasys3, vgaPins)
 import           FakeSdCard              (fakeCard, sectorByte)
 import           FakeTmp2                (celsius, fakeTmp2, reading, tmp2Address,
                                           tmp2Id)
@@ -38,6 +38,14 @@ import           Protocol.I2C            (I2cOp (..), I2cOut (..), I2cReply (..)
                                           addressFor, i2cMaster, openDrain)
 import           Protocol.SPI            (SpiOut (..), spiMaster)
 import           Protocol.UART           (UartRx (..), UartTx (..), uartRx, uartTx)
+import           Protocol.VGA            (Coord, Mode (..), Polarity (..), Scan (..),
+                                          Timing (..), refresh, scan, totals,
+                                          vga640x480at60)
+import           Screen                  (Rgb (..), bands, black, blue, border,
+                                          checker, cyan, green, grey, magenta, mono,
+                                          red, rgb332, rgb444, white, yellow)
+import           Screen.Font             (cellAt, glyphAddr, glyphRow, ink, unscii8,
+                                          within)
 import           Serial                  (Source, atReset, before, decoded, report,
                                           say, silent, transmit)
 
@@ -268,6 +276,141 @@ said v = P.map hexChar (P.reverse (toList (hexDigits v))) P.++ [0x0D, 0x0A]
 -- | "Hi!", the string the 'before' and 'silent' checks hand over.
 hi :: [BitVector 8]
 hi = [0x48, 0x69, 0x21]
+
+-- * The screen
+
+-- | 640x480 shrunk by eighty in one direction and a hundred and sixty in the
+-- other, with the same four spans per axis and the same polarity: four visible
+-- pixels of a line of eight, three visible lines of six. Forty-eight pixel periods
+-- a frame against 420,000, which is the whole reason 'Mode' is a record of values
+-- and not of type-level naturals -- a raster nobody could simulate is a raster
+-- nobody tests.
+--
+-- The numbers are deliberately all different, so a transposed 'front' and 'back' or
+-- a horizontal count used vertically cannot pass.
+tiny :: Mode
+tiny = Mode
+  { horizontal = Timing { visible = 4, front = 1, pulse = 2, back = 1
+                        , polarity = Negative }
+  , vertical   = Timing { visible = 3, front = 1, pulse = 1, back = 1
+                        , polarity = Negative }
+  }
+
+-- | 'tiny' with both syncs the other way up, and nothing else changed.
+tinyPositive :: Mode
+tinyPositive = Mode
+  { horizontal = (horizontal tiny) { polarity = Positive }
+  , vertical   = (vertical   tiny) { polarity = Positive }
+  }
+
+-- | A raster with one pixel per clock cycle, which is what makes a frame 48
+-- samples: the enable 'Basys3.pixel' supplies on the board is what turns a cycle
+-- count into a pixel count, and here there is nothing to slow down for.
+rasterOf :: Mode -> [Scan]
+rasterOf m = sampleN 240
+               (withClockResetEnable clockGen resetGen enableGen
+                  (scan m (pure True) :: Signal System Scan))
+
+-- | Two consecutive whole frames, found by looking for a frame start rather than by
+-- counting from reset -- the same reason 'txSent' hunts for the start bit instead of
+-- trusting how long 'resetGen' holds. Dropping 48 samples first puts us clear of
+-- reset, and the next 'scanFrame' after that is a real one.
+--
+-- Two frames rather than one because a counter that wraps wrongly still gets the
+-- first frame right: the wrap is the part only a second frame can see.
+alignedFrames :: Mode -> [Scan]
+alignedFrames m = P.take 96 (P.dropWhile (P.not . scanFrame) (P.drop 48 (rasterOf m)))
+
+tinyFrames :: [Scan]
+tinyFrames = alignedFrames tiny
+
+-- | The first of them.
+tinyFrame :: [Scan]
+tinyFrame = P.take 48 tinyFrames
+
+-- | The same frame of the same mode with both syncs the other way up, which should
+-- differ from 'tinyFrame' in exactly the two sync bits and nothing else.
+positive :: [Scan]
+positive = P.take 48 (alignedFrames tinyPositive)
+
+-- | Where the beam says it is, wherever it says it is at all: 12 of the 48.
+tinyVisible :: [(Coord, Coord)]
+tinyVisible = mapMaybe scanAt tinyFrame
+
+-- | Every visible position of 'tiny' in raster order, spelt by a comprehension
+-- rather than by the counters under test -- x fastest, which is what makes it a
+-- raster and not a column scan.
+rasterOrder :: [(Coord, Coord)]
+rasterOrder = [(x, y) | y <- [0 .. 2], x <- [0 .. 3]]
+
+-- | One frame of 'tiny' as it would reach the connector, painted 'white'
+-- everywhere: the pixel function a design should not be able to get wrong with.
+-- Whatever it says, the porches have to come out black.
+tinyPins :: [Vga]
+tinyPins = [vgaPins s (white :: Colour) | s <- tinyFrame]
+
+-- | Which of the 48 pixel periods put something other than black on the pins, and
+-- which of them the beam said were visible. These two lists have to be equal, and
+-- 'tinyPins' paints white everywhere, so the only thing that can make them equal is
+-- 'vgaPins' blanking the porches itself.
+litAt, visibleAt :: [P.Int]
+litAt     = [i | (i, p) <- P.zip [0 ..] tinyPins, notBlack p]
+ where
+  notBlack p = (redPin p, greenPin p, bluePin p) P./= (0, 0, 0)
+visibleAt = [i | (i, s) <- P.zip [0 ..] tinyFrame, isJust (scanAt s)]
+
+-- | One pin value spelt out by hand: red at full scale, green dark, blue at half,
+-- hsync idle and vsync in its pulse. Packed, this is the 14 bits the connector
+-- gets, so comparing it against a literal is what fixes the field order that
+-- @constraints\/Basys3-Vga.xdc@ and 'Basys3.vgaPort' both assume -- and the width,
+-- which is the pin count.
+onePin :: BitVector 14
+onePin = pack (vgaPins beam (Rgb 0xF 0x0 0x8 :: Colour))
+ where
+  beam = Scan { scanHsync = high
+              , scanVsync = low
+              , scanAt    = Just (0, 0)
+              , scanFrame = False
+              }
+
+-- | Ten greys, so a band can be told from its neighbours by value and a failure
+-- names the bar it got wrong.
+palette :: Vec 10 Colour
+palette = map grey (iterateI (+ 1) 1)
+
+-- | The width of each run of one colour across a whole 640-pixel line. Ten bars of
+-- 64 is what @'bands' 6@ over ten entries has to come to, which is the arithmetic
+-- that makes a shift enough and a divider unnecessary.
+barWidths :: [P.Int]
+barWidths = P.map P.length (group [bands 6 palette x | x <- [0 .. 639]])
+
+-- * A font in a ROM
+
+-- | One row of a glyph as eight characters, which is the whole reason a font is
+-- testable at all: a mismatch prints the letter it actually drew instead of eight
+-- hex bytes nobody can read. It also puts 'ink' under test in both directions --
+-- the bit order and which end of the byte is the left of the screen.
+picture :: BitVector 8 -> P.String
+picture row = [if ink row x then '#' else '.' | x <- [0 .. 7]]
+
+-- | A whole glyph of 'unscii8', drawn. Taken straight out of the 'MemBlob' rather
+-- than through 'glyphAddr', so that this and the address check below cannot both be
+-- wrong in the same direction and agree.
+glyphArt :: BitVector 8 -> [P.String]
+glyphArt code = P.map picture (P.take 8 (P.drop (8 P.* P.fromIntegral code) bytes))
+ where
+  bytes = unpackMemBlob unscii8
+
+-- | The eight rows of 'A' read out of the ROM as a circuit, a cycle after their
+-- addresses. Index 0 of the trace is whatever the output register held before the
+-- first address reached it, so the comparison starts at 1.
+fontTrace :: [BitVector 8]
+fontTrace = sampleN 12
+              (withClockResetEnable clockGen resetGen enableGen
+                 (glyphRow (fromList (addrs P.++ P.repeat 0))
+                    :: Signal System (BitVector 8)))
+ where
+  addrs = [glyphAddr 0x41 y | y <- [0 .. 7]]
 
 -- * Base ten
 
@@ -580,8 +723,8 @@ main = do
   -- together: 'settle' and the rest are literals, and this is what would notice
   -- if the domain's period changed and they did not.
   timingOk <- check "the board's cycle counts are what its 100 MHz clock makes them"
-                [(cyclesFor 5e-3, cyclesFor 1e-3, cyclesFor (1 P./ 115200))]
-                [(toInteger settle, toInteger dwell, toInteger baud115200)]
+                [(cyclesFor 5e-3, cyclesFor 1e-3, cyclesFor (1 P./ 115200), cyclesFor (1 P./ 25e6))]
+                [(toInteger settle, toInteger dwell, toInteger baud115200, toInteger dot)]
   tickOk   <- check "the prescaler pulses once every limit + 1 cycles"
                 [[3, 3, 3, 3]]
                 [P.take 4 (P.zipWith (P.-) (P.drop 1 tickAt) tickAt)]
@@ -710,6 +853,132 @@ main = do
                [ spoke 400 (silent `before` say $(ascii "Hi!") atReset)
                , spoke 400 (say $(ascii "Hi!") atReset `before` silent) ]
 
+  -- The mode's own arithmetic, which is what a transposed porch gets caught by --
+  -- the alternative place to find that out is a monitor saying "no signal".
+  modeOk  <- check "640x480 at 60 Hz adds up to 800 x 525"
+               [(800, 525)] [totals vga640x480at60]
+  -- Hundredths of a Hz, so the 0.7% the divide costs is visible as the number it
+  -- actually is rather than hidden by a tolerance.
+  hzOk    <- check "and refreshes at 59.52 Hz on a 25 MHz dot clock, 59.94 on a true one"
+               [(5952, 5994) :: (P.Integer, P.Integer)]
+               [( P.round (refresh vga640x480at60 25e6     P.* 100)
+                , P.round (refresh vga640x480at60 25.175e6 P.* 100) )]
+
+  -- The raster itself, on a mode small enough to look at whole. Sample index i is
+  -- pixel (i `mod` 8, i `div` 8) of the frame, which is what makes the expected
+  -- lists below readable: two lows in every eight is one sync pulse a line.
+  rasterOk <- check "the beam visits every visible pixel of a frame once, in raster order"
+                rasterOrder tinyVisible
+  wrapOk   <- check "and the frame after it is identical, so the counters wrap"
+                tinyFrame (P.drop 48 tinyFrames)
+  startOk  <- check "scanFrame marks the first pixel of the frame and no other"
+                [[0 :: P.Int]]
+                [[i | (i, s) <- P.zip [0 ..] tinyFrame, scanFrame s]]
+  hsyncOk  <- check "hsync pulses low after the visible span and the front porch"
+                [[5, 6, 13, 14, 21, 22, 29, 30, 37, 38, 45, 46] :: [P.Int]]
+                [[i | (i, s) <- P.zip [0 ..] tinyFrame, scanHsync s P.== low]]
+  -- The vertical numbers are lines, so one line of sync is eight pixel periods.
+  vsyncOk  <- check "vsync pulses low for one whole line of the six"
+                [[32 .. 39] :: [P.Int]]
+                [[i | (i, s) <- P.zip [0 ..] tinyFrame, scanVsync s P.== low]]
+  -- Polarity is the mode's, not the board's, and the only thing it may change.
+  polarOk  <- check "a positive mode idles its syncs low and pulses them high, nowhere else"
+                [(P.map scanHsync tinyFrame, P.map scanVsync tinyFrame)]
+                [( P.map (complement . scanHsync) positive
+                 , P.map (complement . scanVsync) positive )]
+  -- Painting white everywhere, which is the worst a pixel function can do: the
+  -- porches still have to reach the connector black, because a monitor measures its
+  -- own black level in them and a bright porch washes out the whole picture.
+  blankOk  <- check "vgaPins blanks the porches whatever the pixel function said"
+                visibleAt litAt
+  -- The 14 bits in the order the constraints file reads them.
+  pinsOk   <- check "the pins pack as red, green, blue, hsync, vsync"
+                [0x3C22] [onePin]
+
+  -- Colour. The claim worth checking is that widening repeats the top bits rather
+  -- than padding with zeros, which is the difference between white and 7/8 grey.
+  fullOk  <- check "every conversion takes its maximum to white"
+               (P.replicate 4 (white :: Colour))
+               [mono True, grey maxBound, rgb332 maxBound, rgb444 maxBound]
+  darkOk  <- check "and its minimum to black"
+               (P.replicate 4 (black :: Colour))
+               [mono False, grey 0, rgb332 0, rgb444 0]
+  -- 3:3:2, red in the high bits, blue on the short channel.
+  packedOk <- check "rgb332 splits a byte 3:3:2 and widens each channel"
+               [red, green, blue, Rgb 0x4 0x4 0x5]
+               (P.map rgb332 [0xE0, 0x1C, 0x03, 0x49])
+  directOk <- check "rgb444 is the DAC's own layout, red in the high bits"
+               [red, green, blue, Rgb 0x1 0x2 0x3]
+               (P.map rgb444 [0xF00, 0x0F0, 0x00F, 0x123])
+  -- 'nub' rather than 'group', which would only notice two of them being equal if
+  -- they happened to be written next to each other.
+  nameOk  <- check "the eight named colours are eight different colours"
+               [8 :: P.Int]
+               [P.length (nub [black, white, red, green, blue, cyan, magenta, yellow :: Colour])]
+
+  -- The patterns, which have to be shifts and compares to fit in a pixel period.
+  -- Ten bars of 64 across 640 is the arithmetic that makes a shift enough.
+  barOk   <- check "bands gives ten equal bars across a 640-pixel line"
+               [P.replicate 10 64] [barWidths]
+  lastOk  <- check "and the last entry extends rather than reading off the end"
+               [P.replicate 3 (palette !! (9 :: P.Int))]
+               [P.map (bands 6 palette) [639, 640, 2047]]
+  checkOk <- check "checker alternates on one bit of x against one bit of y"
+               [white, black, black, white :: Colour]
+               (P.map (checker 3 white black) [(0, 0), (8, 0), (0, 8), (8, 8)])
+  edgeOk  <- check "border is set within its width of any edge and clear inside"
+               [True, True, True, True, False, False]
+               (P.map (border 4 (640, 480))
+                  [(0, 0), (3, 0), (639, 479), (636, 475), (4, 4), (635, 475)])
+
+  -- The font. Drawn rather than compared as bytes, so a failure shows the glyph:
+  -- this is provenance as much as correctness, since a generator that got the
+  -- codepoint or the glyph-major order wrong still produces 2048 plausible bytes.
+  sizeOk  <- check "the font ROM is 256 glyphs of eight rows"
+               [2048 :: P.Int] [P.length (unpackMemBlob unscii8)]
+  letterOk <- check "glyph 0x41 of unscii8 is a capital A"
+               [ "...##..."
+               , "..####.."
+               , ".##..##."
+               , ".##..##."
+               , ".######."
+               , ".##..##."
+               , ".##..##."
+               , "........" ]
+               (glyphArt 0x41)
+  -- A descender, so the bottom two rows cannot be quietly dropped -- which is the
+  -- shape of mistake an 8x8 font invites, the cell having no room to spare.
+  tailOk  <- check "and glyph 0x67 is a lower-case g, descender included"
+               [ "........"
+               , "........"
+               , "..#####."
+               , ".##..##."
+               , ".##..##."
+               , "..#####."
+               , ".....##."
+               , ".#####.." ]
+               (glyphArt 0x67)
+  -- The claim the whole cell size rests on: the address is a concatenation, so the
+  -- eight addresses of a glyph are consecutive and y's upper bits play no part.
+  glyphOk <- check "glyphAddr concatenates the code and the low three bits of y"
+               [[520 .. 527] :: [P.Integer]]
+               [P.map (toInteger . glyphAddr 0x41) [0 .. 7]]
+  anyYOk  <- check "so a y anywhere on the screen addresses its row of the cell"
+               [(520, 521, 527) :: (P.Integer, P.Integer, P.Integer)]
+               [( toInteger (glyphAddr 0x41 8)
+                , toInteger (glyphAddr 0x41 481)
+                , toInteger (glyphAddr 0x41 479) )]
+  -- And the ROM as a circuit, which is what actually becomes a block RAM.
+  romOk   <- check "the ROM hands back a glyph's rows a cycle after their addresses"
+               [0x18, 0x3C, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x00]
+               (P.take 8 (P.drop 1 fontTrace))
+  -- The text grid. 80 x 60 cells is the one place 640x480 divides by eight exactly.
+  cellOk  <- check "cellAt gives the cell, and the grid when asked about the picture"
+               [(1, 2), (0, 0), (79, 59), (80, 60)]
+               (P.map cellAt [(12, 20), (7, 7), (639, 479), (640, 480)])
+  withinOk <- check "within is the position inside the cell, and wraps every eight"
+               [0, 7, 0, 1] (P.map within [0, 7, 8, 641])
+
   -- CMD0 and CMD8 are the two commands whose CRC a card actually checks, and
   -- both frames are documented constants -- 0x95 and 0x87 -- so they pin down
   -- the CRC7 implementation exactly.
@@ -831,6 +1100,12 @@ main = do
                 , charOk, nibOk, spellOk
                 , digitsOk, allDecOk, narrowOk, decOk
                 , sayOk, doneOk, freezeOk, mergeOk, firstOk, orderOk, quietSrcOk
+                , modeOk, hzOk
+                , rasterOk, wrapOk, startOk, hsyncOk, vsyncOk, polarOk
+                , blankOk, pinsOk
+                , fullOk, darkOk, packedOk, directOk, nameOk
+                , barOk, lastOk, checkOk, edgeOk
+                , sizeOk, letterOk, tailOk, glyphOk, anyYOk, romOk, cellOk, withinOk
                 , crcOk, echoOk, readyOk, failOk, ocrOk, idxOk, dataOk, sigOk
                 , deadOk, retryOk
                 , wireOk, saidOk, highOk, lowOk, heldOk, keptOk
