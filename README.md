@@ -3,10 +3,11 @@
 A library of the Basys3's own hardware, written in Haskell with
 [Clash](https://clash-lang.org) and built on Apple Silicon: the display's
 multiplexing, the buttons' debouncing, a UART at the baud rate the board's bridge
-wants, base ten and base sixteen, an SD card over SPI, VGA at 640x480 with a font
-in it, and the pin names and clock period that the toolchain needs and that nobody
-should be retyping. Closer to an Arduino library than to a demo: the parts are meant
-to be picked up and used, and the four designs here are what using them looks like.
+wants, base ten and base sixteen, an SD card over SPI, an I2C master for whatever is
+on the Pmod headers, VGA at 640x480 with a font in it, and the pin names and clock
+period that the toolchain needs and that nobody should be retyping. Closer to an
+Arduino library than to a demo: the parts are meant to be picked up and used, and
+the four designs here are what using them looks like.
 
 The board is a Digilent Basys3: AMD Artix-7 `xc7a35tcpg236-1`, 100 MHz clock on
 pin W5, 16 LEDs, a four-digit seven-segment display, a VGA connector, and an
